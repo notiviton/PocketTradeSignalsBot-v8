@@ -16,7 +16,7 @@ from data.provider import MarketDataError
 # ВСТАВЬ СЮДА ТОТ ЖЕ САМЫЙ РАБОЧИЙ TELEGRAM TOKEN
 # ============================================================
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("8587113648:AAG9aKldVZNb8oS8Xy53rKoySk0XYkBSh98")
 
 
 # ============================================================
