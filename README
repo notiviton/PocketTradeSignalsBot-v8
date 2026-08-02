@@ -1,0 +1,28 @@
+# PocketTradeSignalsBot v8
+
+Аналитический Telegram-бот. Автоматическое открытие сделок отключено.
+
+## Источники котировок
+- `twelvedata` — Twelve Data.
+- `pocket_otc` — Pocket Option OTC через настроенный bridge/adapter.
+
+Переключение выполняется в Telegram в разделе `Настройки`.
+
+Важно: Pocket Option не предоставляет стабильный официальный публичный API для OTC-истории в виде стандартного REST endpoint. Поэтому проект не содержит выдуманного URL. OTC-провайдер работает fail-closed и требует проверенный bridge, задаваемый через `POCKET_OPTION_OTC_API_URL`. Существующие сторонние WebSocket-клиенты требуют сессионную авторизацию и могут ломаться при изменениях платформы.
+
+## Переменные окружения
+Скопируйте `.env.example` в настройки Railway Variables и задайте:
+- `TELEGRAM_BOT_TOKEN`
+- `TWELVE_DATA_API_KEY`
+- `MARKET_DATA_SOURCE=twelvedata` или `pocket_otc`
+- для OTC: `POCKET_OPTION_OTC_API_URL` и при необходимости `POCKET_OPTION_OTC_API_KEY`
+
+## Запуск
+```bash
+pip install -r requirements.txt
+pytest -q
+python bot.py
+```
+
+## Безопасность
+Telegram-токен не хранится в исходном коде. Если старый токен когда-либо был опубликован в GitHub/Railway logs/чате, его необходимо отозвать через BotFather и создать новый.
