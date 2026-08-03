@@ -674,6 +674,60 @@ async def status_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+# ============================================================
+# INDICATORS
+# ============================================================
+
+@dp.callback_query(F.data == "indicators")
+async def indicators_callback(callback: CallbackQuery):
+
+    settings = get_user_settings(
+        callback.from_user.id
+    )
+
+    await callback.message.answer(
+        "⏳ Получаю рыночные данные...\n\n"
+        f"💱 {settings['symbol']}\n"
+        f"⏱ {settings['timeframe']}\n\n"
+        "🕯 Загружаю 500 свечей..."
+    )
+
+    try:
+
+        market = forex_service.get_market(
+            source=settings["source"],
+            symbol=settings["symbol"],
+            timeframe=settings["timeframe"],
+            limit=500,
+        )
+
+        await callback.message.answer(
+            "🧮 Рассчитываю технические индикаторы..."
+        )
+
+        indicator_engine = IndicatorEngine(
+            market.candles
+        )
+
+        indicators = indicator_engine.calculate_all()
+
+        await callback.message.answer(
+            format_indicators(
+                indicators=indicators,
+                symbol=settings["symbol"],
+                timeframe=settings["timeframe"],
+            )
+        )
+
+    except Exception as exc:
+
+        await callback.message.answer(
+            "❌ Ошибка расчёта индикаторов.\n\n"
+            f"Причина: {exc}"
+        )
+
+    await callback.answer()
+
 
 # ============================================================
 # MAIN
