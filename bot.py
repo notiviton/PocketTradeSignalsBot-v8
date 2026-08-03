@@ -730,6 +730,31 @@ async def indicators_callback(callback: CallbackQuery):
 
 
 # ============================================================
+# SETTINGS
+# ============================================================
+
+@dp.callback_query(F.data == "settings")
+async def settings_callback(callback: CallbackQuery):
+
+    settings = get_user_settings(
+        callback.from_user.id
+    )
+
+    await callback.message.answer(
+        "⚙️ НАСТРОЙКИ\n\n"
+        f"💱 Инструмент: {settings['symbol']}\n"
+        f"⏱ Таймфрейм: {settings['timeframe']}\n"
+        f"📡 Источник: {settings['source']}\n\n"
+        "Выберите параметр для изменения:",
+        reply_markup=settings_menu(
+            callback.from_user.id
+        ),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
