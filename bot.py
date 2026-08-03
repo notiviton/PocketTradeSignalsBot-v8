@@ -8,6 +8,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from indicators.indicator_engine import IndicatorEngine
 from services.forex_service import ForexService
+from signals.signal_engine import SignalEngine
 
 
 # ============================================================
@@ -33,6 +34,7 @@ dp = Dispatcher()
 # ============================================================
 
 forex_service = ForexService()
+signal_engine = SignalEngine()
 
 
 # ============================================================
@@ -43,6 +45,7 @@ user_settings = {}
 
 DEFAULT_SYMBOL = "EUR/USD"
 DEFAULT_TIMEFRAME = "1m"
+
 DEFAULT_SOURCE = os.getenv(
     "MARKET_DATA_SOURCE",
     "twelvedata",
@@ -50,7 +53,9 @@ DEFAULT_SOURCE = os.getenv(
 
 
 def get_user_settings(user_id: int):
+
     if user_id not in user_settings:
+
         user_settings[user_id] = {
             "symbol": DEFAULT_SYMBOL,
             "timeframe": DEFAULT_TIMEFRAME,
@@ -65,6 +70,7 @@ def get_user_settings(user_id: int):
 # ============================================================
 
 def main_menu():
+
     builder = InlineKeyboardBuilder()
 
     builder.button(
@@ -107,6 +113,7 @@ def main_menu():
 # ============================================================
 
 def settings_menu(user_id: int):
+
     settings = get_user_settings(user_id)
 
     builder = InlineKeyboardBuilder()
@@ -141,6 +148,7 @@ def settings_menu(user_id: int):
 # ============================================================
 
 def symbol_menu():
+
     symbols = [
         "EUR/USD",
         "GBP/USD",
@@ -154,6 +162,7 @@ def symbol_menu():
     builder = InlineKeyboardBuilder()
 
     for symbol in symbols:
+
         builder.button(
             text=f"💱 {symbol}",
             callback_data=f"symbol:{symbol}",
@@ -174,6 +183,7 @@ def symbol_menu():
 # ============================================================
 
 def timeframe_menu():
+
     timeframes = [
         "1m",
         "5m",
@@ -187,6 +197,7 @@ def timeframe_menu():
     builder = InlineKeyboardBuilder()
 
     for timeframe in timeframes:
+
         builder.button(
             text=f"⏱ {timeframe}",
             callback_data=f"timeframe:{timeframe}",
@@ -207,6 +218,7 @@ def timeframe_menu():
 # ============================================================
 
 def source_menu():
+
     builder = InlineKeyboardBuilder()
 
     builder.button(
@@ -230,6 +242,70 @@ def source_menu():
 
 
 # ============================================================
+# FORMAT SIGNAL
+# ============================================================
+
+def format_signal(
+    result,
+    symbol,
+    timeframe,
+):
+
+    signal_name = {
+        "CALL": "🟢 CALL",
+        "PUT": "🔴 PUT",
+        "FLAT": "🟡 FLAT",
+    }.get(
+        result.signal,
+        result.signal,
+    )
+
+    text = (
+
+        "📈 ТОРГОВЫЙ СИГНАЛ\n\n"
+
+        f"💱 Инструмент: {symbol}\n"
+        f"⏱ Таймфрейм: {timeframe}\n\n"
+
+        f"Сигнал: {signal_name}\n"
+
+        f"Уверенность: {result.confidence:.2f}%\n\n"
+
+        f"🟢 Бычий счёт: {result.bullish_score}\n"
+
+        f"🔴 Медвежий счёт: {result.bearish_score}\n\n"
+
+        "Причины:\n"
+    )
+
+
+    for reason in result.reasons:
+
+        text += f"• {reason}\n"
+
+
+    if result.warnings:
+
+        text += "\n⚠️ Предупреждения:\n"
+
+        for warning in result.warnings:
+
+            text += f"• {warning}\n"
+
+
+    text += (
+
+        "\n⚠️ Только аналитика.\n"
+
+        "Автоматическое открытие сделок отключено."
+
+    )
+
+
+    return text
+
+
+# ============================================================
 # FORMAT INDICATORS
 # ============================================================
 
@@ -238,71 +314,58 @@ def format_indicators(
     symbol,
     timeframe,
 ):
+
     return (
+
         "📊 ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ\n\n"
+
         f"💱 Инструмент: {symbol}\n"
         f"⏱ Таймфрейм: {timeframe}\n"
+
         f"💰 Цена Close: {indicators['close']:.5f}\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
+
         "📈 RSI\n"
+
         "━━━━━━━━━━━━━━━━━━\n"
+
         f"RSI(14): {indicators['rsi']:.2f}\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
+
         "📉 MACD\n"
+
         "━━━━━━━━━━━━━━━━━━\n"
+
         f"MACD: {indicators['macd']:.6f}\n"
+
         f"Signal: {indicators['macd_signal']:.6f}\n"
+
         f"Histogram: {indicators['macd_histogram']:.6f}\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
+
         "📊 STOCHASTIC\n"
+
         "━━━━━━━━━━━━━━━━━━\n"
+
         f"%K: {indicators['stochastic_k']:.2f}\n"
+
         f"%D: {indicators['stochastic_d']:.2f}\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
+
         "📐 BOLLINGER BANDS\n"
+
         "━━━━━━━━━━━━━━━━━━\n"
+
         f"Upper: {indicators['bollinger_upper']:.5f}\n"
+
         f"Middle: {indicators['bollinger_middle']:.5f}\n"
-        f"Lower: {indicators['bollinger_lower']:.5f}\n\n"
 
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📏 EMA\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"EMA 9: {indicators['ema_9']:.5f}\n"
-        f"EMA 21: {indicators['ema_21']:.5f}\n"
-        f"EMA 50: {indicators['ema_50']:.5f}\n"
-        f"EMA 200: {indicators['ema_200']:.5f}\n\n"
+        f"Lower: {indicators['bollinger_lower']:.5f}\n"
 
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📊 ADX\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"ADX: {indicators['adx']:.2f}\n"
-        f"+DI: {indicators['plus_di']:.2f}\n"
-        f"-DI: {indicators['minus_di']:.2f}\n\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📏 ATR\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"ATR(14): {indicators['atr']:.6f}\n\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📊 CCI\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"CCI(20): {indicators['cci']:.2f}\n\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📉 WILLIAMS %R\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"Williams %R: {indicators['williams_r']:.2f}\n\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ Это расчёт индикаторов.\n"
-        "Торговый сигнал автоматически не формируется.\n"
-        "Автоматическое открытие сделок отключено."
     )
 
 
@@ -312,14 +375,23 @@ def format_indicators(
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    get_user_settings(message.from_user.id)
+
+    get_user_settings(
+        message.from_user.id
+    )
 
     await message.answer(
+
         "✅ PocketTradeSignalsBot запущен.\n\n"
+
         "Это аналитический бот.\n"
+
         "Автоматическое открытие реальных сделок отключено.\n\n"
+
         "Выберите действие:",
+
         reply_markup=main_menu(),
+
     )
 
 
@@ -329,222 +401,23 @@ async def start(message: Message):
 
 @dp.message(Command("test_forex"))
 async def test_forex(message: Message):
-    settings = get_user_settings(message.from_user.id)
 
-    symbol = settings["symbol"]
-    timeframe = settings["timeframe"]
+    settings = get_user_settings(
+        message.from_user.id
+    )
 
     await message.answer(
-        "⏳ Проверяю подключение к источнику данных...\n\n"
-        f"💱 Инструмент: {symbol}\n"
-        f"⏱ Таймфрейм: {timeframe}\n\n"
-        "Получаю реальные свечи."
+        "⏳ Проверяю подключение к источнику данных..."
     )
 
     result = forex_service.get_last_prices(
-        symbol=symbol,
-        timeframe=timeframe,
+        symbol=settings["symbol"],
+        timeframe=settings["timeframe"],
         source=settings["source"],
     )
 
     await message.answer(result)
 
-
-# ============================================================
-# INDICATORS COMMAND
-# ============================================================
-
-@dp.message(Command("indicators"))
-async def indicators_command(message: Message):
-    settings = get_user_settings(message.from_user.id)
-
-    symbol = settings["symbol"]
-    timeframe = settings["timeframe"]
-
-    await message.answer(
-        "⏳ Рассчитываю технические индикаторы...\n\n"
-        f"💱 Инструмент: {symbol}\n"
-        f"⏱ Таймфрейм: {timeframe}\n"
-        "🕯 Загружаю 500 свечей."
-    )
-
-    try:
-        market = forex_service.get_market(
-            source=settings["source"],
-            symbol=symbol,
-            timeframe=timeframe,
-            limit=500,
-        )
-
-        engine = IndicatorEngine(market.candles)
-
-        indicators = engine.calculate_all()
-
-        result = format_indicators(
-            indicators=indicators,
-            symbol=symbol,
-            timeframe=timeframe,
-        )
-
-        await message.answer(result)
-
-    except Exception as exc:
-        await message.answer(
-            "❌ Ошибка расчёта индикаторов.\n\n"
-            f"Причина: {exc}"
-        )
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-@dp.callback_query(F.data == "settings")
-async def settings_callback(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "⚙️ Настройки анализа\n\n"
-        "Выберите инструмент или таймфрейм:",
-        reply_markup=settings_menu(
-            callback.from_user.id
-        ),
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# SELECT SOURCE
-# ============================================================
-
-@dp.callback_query(F.data == "select_source")
-async def select_source_callback(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "📡 Выберите источник котировок:",
-        reply_markup=source_menu(),
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("source:"))
-async def source_selected(callback: CallbackQuery):
-    source = callback.data.split(":", 1)[1]
-
-    settings = get_user_settings(
-        callback.from_user.id
-    )
-
-    settings["source"] = source
-
-    await callback.message.edit_text(
-        "✅ Источник выбран.\n\n"
-        f"📡 {source}\n"
-        f"💱 {settings['symbol']}\n"
-        f"⏱ {settings['timeframe']}",
-        reply_markup=settings_menu(
-            callback.from_user.id
-        ),
-    )
-
-    await callback.answer("Источник изменён")
-
-
-# ============================================================
-# SELECT SYMBOL
-# ============================================================
-
-@dp.callback_query(F.data == "select_symbol")
-async def select_symbol_callback(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "💱 Выберите валютную пару:",
-        reply_markup=symbol_menu(),
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# SELECT TIMEFRAME
-# ============================================================
-
-@dp.callback_query(F.data == "select_timeframe")
-async def select_timeframe_callback(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "⏱ Выберите таймфрейм:",
-        reply_markup=timeframe_menu(),
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# SYMBOL SELECTION
-# ============================================================
-
-@dp.callback_query(F.data.startswith("symbol:"))
-async def symbol_selected(callback: CallbackQuery):
-    symbol = callback.data.split(":", 1)[1]
-
-    settings = get_user_settings(
-        callback.from_user.id
-    )
-
-    settings["symbol"] = symbol
-
-    await callback.message.edit_text(
-        "✅ Инструмент выбран.\n\n"
-        f"💱 {symbol}\n"
-        f"⏱ Таймфрейм: {settings['timeframe']}",
-        reply_markup=settings_menu(
-            callback.from_user.id
-        ),
-    )
-
-    await callback.answer(
-        f"Выбран {symbol}"
-    )
-
-
-# ============================================================
-# TIMEFRAME SELECTION
-# ============================================================
-
-@dp.callback_query(F.data.startswith("timeframe:"))
-async def timeframe_selected(callback: CallbackQuery):
-    timeframe = callback.data.split(":", 1)[1]
-
-    settings = get_user_settings(
-        callback.from_user.id
-    )
-
-    settings["timeframe"] = timeframe
-
-    await callback.message.edit_text(
-        "✅ Таймфрейм выбран.\n\n"
-        f"💱 Инструмент: {settings['symbol']}\n"
-        f"⏱ Таймфрейм: {timeframe}",
-        reply_markup=settings_menu(
-            callback.from_user.id
-        ),
-    )
-
-    await callback.answer(
-        f"Выбран таймфрейм {timeframe}"
-    )
-
-
-# ============================================================
-# MAIN MENU
-# ============================================================
-
-@dp.callback_query(F.data == "main_menu")
-async def main_menu_callback(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "🏠 Главное меню",
-        reply_markup=main_menu(),
-    )
-
-    await callback.answer()
 
 
 # ============================================================
@@ -553,19 +426,102 @@ async def main_menu_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "signal")
 async def signal_callback(callback: CallbackQuery):
+
     settings = get_user_settings(
         callback.from_user.id
     )
 
+
     await callback.message.answer(
-        "📈 Получение сигнала\n\n"
-        f"💱 Инструмент: {settings['symbol']}\n"
-        f"⏱ Таймфрейм: {settings['timeframe']}\n\n"
-        "⏳ Сигнальный движок запускается...\n\n"
-        "⚠️ Автоматическое открытие сделок отключено."
+
+        "⏳ Получаю рыночные данные...\n\n"
+
+        f"💱 {settings['symbol']}\n"
+
+        f"⏱ {settings['timeframe']}\n\n"
+
+        "🕯 Загружаю 500 свечей..."
+
     )
 
+
+    try:
+
+        market = forex_service.get_market(
+
+            source=settings["source"],
+
+            symbol=settings["symbol"],
+
+            timeframe=settings["timeframe"],
+
+            limit=500,
+
+        )
+
+
+        await callback.message.answer(
+
+            "🧮 Рассчитываю индикаторы..."
+
+        )
+
+
+        indicator_engine = IndicatorEngine(
+
+            market.candles
+
+        )
+
+
+        indicators = indicator_engine.calculate_all()
+
+
+
+        await callback.message.answer(
+
+            "🤖 Анализирую сигнал..."
+
+        )
+
+
+
+        result = signal_engine.analyze(
+
+            indicators
+
+        )
+
+
+
+        await callback.message.answer(
+
+            format_signal(
+
+                result=result,
+
+                symbol=settings["symbol"],
+
+                timeframe=settings["timeframe"],
+
+            )
+
+        )
+
+
+    except Exception as exc:
+
+        await callback.message.answer(
+
+            "❌ Ошибка формирования сигнала.\n\n"
+
+            f"Причина: {exc}"
+
+        )
+
+
     await callback.answer()
+
 
 
 # ============================================================
@@ -574,66 +530,23 @@ async def signal_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "analysis")
 async def analysis_callback(callback: CallbackQuery):
-    settings = get_user_settings(
-        callback.from_user.id
-    )
 
     await callback.message.answer(
+
         "📊 Анализ рынка\n\n"
-        f"💱 Инструмент: {settings['symbol']}\n"
-        f"⏱ Таймфрейм: {settings['timeframe']}\n\n"
-        "🟢 Источник рыночных данных: выбран\n"
-        "🟢 Технические индикаторы: доступны\n"
-        "🟡 Сигнальный движок: следующий этап\n\n"
+
+        "🟢 Market Data Layer: ONLINE\n"
+
+        "🟢 Indicator Engine: ONLINE\n"
+
+        "🟢 Signal Engine: ONLINE\n\n"
+
         "Автоматическая торговля отключена."
+
     )
 
     await callback.answer()
 
-
-# ============================================================
-# INDICATORS BUTTON
-# ============================================================
-
-@dp.callback_query(F.data == "indicators")
-async def indicators_callback(callback: CallbackQuery):
-    settings = get_user_settings(
-        callback.from_user.id
-    )
-
-    await callback.message.answer(
-        "⏳ Рассчитываю технические индикаторы...\n\n"
-        f"💱 Инструмент: {settings['symbol']}\n"
-        f"⏱ Таймфрейм: {settings['timeframe']}"
-    )
-
-    try:
-        market = forex_service.get_market(
-            source=settings["source"],
-            symbol=settings["symbol"],
-            timeframe=settings["timeframe"],
-            limit=500,
-        )
-
-        engine = IndicatorEngine(market.candles)
-
-        indicators = engine.calculate_all()
-
-        result = format_indicators(
-            indicators=indicators,
-            symbol=settings["symbol"],
-            timeframe=settings["timeframe"],
-        )
-
-        await callback.message.answer(result)
-
-    except Exception as exc:
-        await callback.message.answer(
-            "❌ Ошибка расчёта индикаторов.\n\n"
-            f"Причина: {exc}"
-        )
-
-    await callback.answer()
 
 
 # ============================================================
@@ -642,43 +555,25 @@ async def indicators_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "status")
 async def status_callback(callback: CallbackQuery):
+
     await callback.message.answer(
+
         "📋 Статус системы\n\n"
+
         "🟢 Telegram Bot: ONLINE\n"
-        "🟢 Приложение: ONLINE\n"
+
         "🟢 Market Data Layer: ONLINE\n"
-        "🟢 12 технических индикаторов: ONLINE\n"
-        "🟢 Gate/Audit контур: TESTED\n"
-        "🟢 Автоматическое открытие сделок: ОТКЛЮЧЕНО\n\n"
-        "⚠️ Фактическое состояние внешнего API "
-        "проверяется отдельной командой /test_forex."
+
+        "🟢 Indicator Engine: ONLINE\n"
+
+        "🟢 Signal Engine: ONLINE\n\n"
+
+        "⚠️ Автоматическое открытие сделок отключено."
+
     )
 
     await callback.answer()
 
-
-# ============================================================
-# ABOUT
-# ============================================================
-
-@dp.callback_query(F.data == "about")
-async def about_callback(callback: CallbackQuery):
-    await callback.message.answer(
-        "ℹ️ PocketTradeSignalsBot\n\n"
-        "Аналитический Telegram-бот "
-        "для формирования торговых сигналов.\n\n"
-        "Основные принципы:\n"
-        "• аналитика вместо автоторговли;\n"
-        "• реальные рыночные данные;\n"
-        "• технические индикаторы;\n"
-        "• fail-closed защита;\n"
-        "• контроль целостности данных;\n"
-        "• Gate / Trade / Audit.\n\n"
-        "Автоматическое открытие реальных "
-        "сделок отключено."
-    )
-
-    await callback.answer()
 
 
 # ============================================================
@@ -686,9 +581,14 @@ async def about_callback(callback: CallbackQuery):
 # ============================================================
 
 async def main():
-    print("PocketTradeSignalsBot started")
 
-    await dp.start_polling(bot)
+    print(
+        "PocketTradeSignalsBot started"
+    )
+
+    await dp.start_polling(
+        bot
+    )
 
 
 # ============================================================
@@ -696,4 +596,5 @@ async def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     asyncio.run(main())
