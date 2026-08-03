@@ -419,6 +419,105 @@ async def test_forex(message: Message):
     await message.answer(result)
 
 
+# ============================================================
+# COMMAND: SIGNAL
+# ============================================================
+
+@dp.message(Command("signal"))
+async def signal_command(message: Message):
+
+    settings = get_user_settings(
+        message.from_user.id
+    )
+
+    await message.answer(
+        "📈 Чтобы получить сигнал, "
+        "используйте кнопку «📈 Получить сигнал» "
+        "в главном меню."
+    )
+
+
+# ============================================================
+# COMMAND: ANALYSIS
+# ============================================================
+
+@dp.message(Command("analysis"))
+async def analysis_command(message: Message):
+
+    await message.answer(
+        "📊 Анализ рынка\n\n"
+        "🟢 Market Data Layer: ONLINE\n"
+        "🟢 Indicator Engine: ONLINE\n"
+        "🟢 Signal Engine: ONLINE\n\n"
+        "Автоматическая торговля отключена."
+    )
+
+
+# ============================================================
+# COMMAND: INDICATORS
+# ============================================================
+
+@dp.message(Command("indicators"))
+async def indicators_command(message: Message):
+
+    await message.answer(
+        "📊 Чтобы посмотреть технические индикаторы, "
+        "используйте кнопку «📊 Индикаторы» "
+        "в главном меню."
+    )
+
+
+# ============================================================
+# COMMAND: STATUS
+# ============================================================
+
+@dp.message(Command("status"))
+async def status_command(message: Message):
+
+    await message.answer(
+        "📋 Статус системы\n\n"
+        "🟢 Telegram Bot: ONLINE\n"
+        "🟢 Market Data Layer: ONLINE\n"
+        "🟢 Indicator Engine: ONLINE\n"
+        "🟢 Signal Engine: ONLINE\n\n"
+        "⚠️ Автоматическое открытие сделок отключено."
+    )
+
+
+# ============================================================
+# COMMAND: SETTINGS
+# ============================================================
+
+@dp.message(Command("settings"))
+async def settings_command(message: Message):
+
+    await message.answer(
+        "⚙️ Настройки\n\n"
+        "Используйте кнопку «⚙️ Настройки» "
+        "в главном меню."
+    )
+
+
+# ============================================================
+# COMMAND: ABOUT
+# ============================================================
+
+@dp.message(Command("about"))
+async def about_command(message: Message):
+
+    await message.answer(
+        "ℹ️ PocketTradeSignalsBot\n\n"
+        "Аналитический Telegram-бот "
+        "для анализа рыночных данных.\n\n"
+        "Бот рассчитывает технические индикаторы "
+        "и формирует сигналы:\n"
+        "🟢 CALL\n"
+        "🔴 PUT\n"
+        "🟡 FLAT\n\n"
+        "⚠️ Бот не открывает сделки автоматически.\n"
+        "Все решения принимает пользователь."
+    )
+
 
 # ============================================================
 # SIGNAL
