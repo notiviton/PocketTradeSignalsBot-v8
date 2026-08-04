@@ -755,6 +755,21 @@ async def settings_callback(callback: CallbackQuery):
 
 
 # ============================================================
+# SELECT SYMBOL
+# ============================================================
+
+@dp.callback_query(F.data == "select_symbol")
+async def select_symbol_callback(callback: CallbackQuery):
+
+    await callback.message.answer(
+        "💱 Выберите инструмент:",
+        reply_markup=symbol_menu(),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
