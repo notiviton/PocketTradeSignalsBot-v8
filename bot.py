@@ -9,6 +9,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from indicators.indicator_engine import IndicatorEngine
 from services.forex_service import ForexService
 from signals.signal_engine import SignalEngine
+from data.assets import FOREX_ASSETS, POCKET_OTC_ASSETS
 
 
 # ============================================================
