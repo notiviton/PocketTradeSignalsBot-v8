@@ -790,6 +790,111 @@ async def save_symbol_callback(callback: CallbackQuery):
 
 
 # ============================================================
+# SELECT TIMEFRAME
+# ============================================================
+
+@dp.callback_query(F.data == "select_timeframe")
+async def select_timeframe_callback(callback: CallbackQuery):
+
+    await callback.message.answer(
+        "⏱ Выберите таймфрейм:",
+        reply_markup=timeframe_menu(),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# SAVE TIMEFRAME
+# ============================================================
+
+@dp.callback_query(F.data.startswith("timeframe:"))
+async def save_timeframe_callback(callback: CallbackQuery):
+
+    timeframe = callback.data.split(":", 1)[1]
+
+    settings = get_user_settings(callback.from_user.id)
+    settings["timeframe"] = timeframe
+
+    await callback.message.answer(
+        f"✅ Таймфрейм изменён на {timeframe}",
+        reply_markup=settings_menu(callback.from_user.id),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# SELECT SOURCE
+# ============================================================
+
+@dp.callback_query(F.data == "select_source")
+async def select_source_callback(callback: CallbackQuery):
+
+    await callback.message.answer(
+        "📡 Выберите источник данных:",
+        reply_markup=source_menu(),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# SAVE SOURCE
+# ============================================================
+
+@dp.callback_query(F.data.startswith("source:"))
+async def save_source_callback(callback: CallbackQuery):
+
+    source = callback.data.split(":", 1)[1]
+
+    settings = get_user_settings(callback.from_user.id)
+    settings["source"] = source
+
+    await callback.message.answer(
+        f"✅ Источник изменён на {source}",
+        reply_markup=settings_menu(callback.from_user.id),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+
+@dp.callback_query(F.data == "main_menu")
+async def main_menu_callback(callback: CallbackQuery):
+
+    await callback.message.answer(
+        "Главное меню:",
+        reply_markup=main_menu(),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# ABOUT
+# ============================================================
+
+@dp.callback_query(F.data == "about")
+async def about_callback(callback: CallbackQuery):
+
+    await callback.message.answer(
+        "ℹ️ PocketTradeSignalsBot\n\n"
+        "Аналитический Telegram-бот.\n\n"
+        "Возможности:\n"
+        "• Получение рыночных данных\n"
+        "• Расчёт технических индикаторов\n"
+        "• Формирование сигналов CALL / PUT / FLAT\n\n"
+        "⚠️ Автоматическое открытие сделок отключено."
+    )
+
+    await callback.answer()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
