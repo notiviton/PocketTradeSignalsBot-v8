@@ -16,6 +16,18 @@ FOREX_PAIRS = [
     "EUR/GBP",
     "EUR/JPY",
     "GBP/JPY",
+    "EUR/AUD",
+    "EUR/CAD",
+    "EUR/NZD",
+    "GBP/AUD",
+    "GBP/CAD",
+    "GBP/NZD",
+    "AUD/CAD",
+    "AUD/CHF",
+    "AUD/NZD",
+    "CAD/JPY",
+    "CHF/JPY",
+    "NZD/JPY",
 ]
 
 
