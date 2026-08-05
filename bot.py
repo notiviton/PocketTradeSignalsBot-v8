@@ -770,6 +770,26 @@ async def select_symbol_callback(callback: CallbackQuery):
 
 
 # ============================================================
+# SAVE SYMBOL
+# ============================================================
+
+@dp.callback_query(F.data.startswith("symbol:"))
+async def save_symbol_callback(callback: CallbackQuery):
+
+    symbol = callback.data.split(":", 1)[1]
+
+    settings = get_user_settings(callback.from_user.id)
+    settings["symbol"] = symbol
+
+    await callback.message.answer(
+        f"✅ Инструмент изменён на {symbol}",
+        reply_markup=settings_menu(callback.from_user.id),
+    )
+
+    await callback.answer()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
