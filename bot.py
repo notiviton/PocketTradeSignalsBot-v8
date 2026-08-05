@@ -150,17 +150,24 @@ def settings_menu(user_id: int):
 
 def symbol_menu():
 
+    symbols = [
+        "EUR/USD",
+        "GBP/USD",
+        "USD/JPY",
+        "USD/CHF",
+        "AUD/USD",
+        "USD/CAD",
+        "NZD/USD",
+    ]
+
     builder = InlineKeyboardBuilder()
 
-    for category, symbols in FOREX_ASSETS.items():
+    for symbol in symbols:
 
-        for symbol in symbols:
-
-            builder.button(
-                text=f"💱 {symbol}",
-                callback_data=f"symbol:{symbol}",
-            )
-
+        builder.button(
+            text=f"💱 {symbol}",
+            callback_data=f"symbol:{symbol}",
+        )
 
     builder.button(
         text="⬅️ Назад",
