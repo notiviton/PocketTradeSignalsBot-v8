@@ -5,18 +5,41 @@ from data.models import Candle, MarketData
 
 
 class MarketDataError(Exception):
-    pass
+    """Ошибка получения или проверки рыночных данных."""
 
 
 class MarketDataProvider(ABC):
+    """
+    Базовый асинхронный интерфейс источника рыночных данных.
+
+    Основной источник проекта:
+        Pocket Option WebSocket
+
+    Провайдер только получает рыночные данные.
+    Торговых операций здесь нет и быть не должно.
+    """
 
     @abstractmethod
-    def get_candles(
+    async def get_candles(
         self,
         symbol: str,
         timeframe: str,
         limit: int = 200,
     ) -> MarketData:
+        """
+        Получить последние свечи.
+
+        Args:
+            symbol: идентификатор инструмента Pocket Option.
+            timeframe: таймфрейм, например "1m", "5m", "15m".
+            limit: максимальное количество свечей.
+
+        Returns:
+            MarketData с отсортированными по времени свечами.
+
+        Raises:
+            MarketDataError: если данные недоступны или некорректны.
+        """
         raise NotImplementedError
 
 
@@ -24,6 +47,17 @@ def validate_candles(
     candles: List[Candle],
     minimum_required: int = 50,
 ) -> None:
+    """
+    Проверяет целостность и корректность набора свечей.
+
+    Свечи должны идти строго по возрастанию timestamp.
+    """
+
+    if not isinstance(candles, list):
+        raise MarketDataError(
+            "Candles must be provided as a list"
+        )
+
     if len(candles) < minimum_required:
         raise MarketDataError(
             f"Insufficient candle data: "
@@ -32,40 +66,71 @@ def validate_candles(
 
     previous_timestamp = 0
 
-    for candle in candles:
+    for index, candle in enumerate(candles):
+        if not isinstance(candle, Candle):
+            raise MarketDataError(
+                f"Invalid candle object at index {index}"
+            )
+
         if candle.timestamp <= 0:
             raise MarketDataError(
-                "Invalid candle timestamp"
+                f"Invalid candle timestamp at index {index}"
             )
 
         if candle.open <= 0:
             raise MarketDataError(
-                "Invalid candle open price"
+                f"Invalid candle open price at index {index}"
             )
 
         if candle.high <= 0:
             raise MarketDataError(
-                "Invalid candle high price"
+                f"Invalid candle high price at index {index}"
             )
 
         if candle.low <= 0:
             raise MarketDataError(
-                "Invalid candle low price"
+                f"Invalid candle low price at index {index}"
             )
 
         if candle.close <= 0:
             raise MarketDataError(
-                "Invalid candle close price"
-            )
-
-        if candle.high < candle.low:
-            raise MarketDataError(
-                "Candle high is lower than low"
+                f"Invalid candle close price at index {index}"
             )
 
         if candle.volume < 0:
             raise MarketDataError(
-                "Invalid candle volume"
+                f"Invalid candle volume at index {index}"
+            )
+
+        # OHLC consistency.
+        if candle.high < candle.low:
+            raise MarketDataError(
+                f"Candle high is lower than low "
+                f"at index {index}"
+            )
+
+        if candle.high < candle.open:
+            raise MarketDataError(
+                f"Candle high is lower than open "
+                f"at index {index}"
+            )
+
+        if candle.high < candle.close:
+            raise MarketDataError(
+                f"Candle high is lower than close "
+                f"at index {index}"
+            )
+
+        if candle.low > candle.open:
+            raise MarketDataError(
+                f"Candle low is higher than open "
+                f"at index {index}"
+            )
+
+        if candle.low > candle.close:
+            raise MarketDataError(
+                f"Candle low is higher than close "
+                f"at index {index}"
             )
 
         if (
