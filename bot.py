@@ -48,7 +48,7 @@ user_settings: dict[int, dict[str, str]] = {}
 
 DEFAULT_SYMBOL = os.getenv(
     "POCKET_OPTION_DEFAULT_SYMBOL",
-    "EURUSD_otc",
+    "EUR/USD OTC",
 )
 
 DEFAULT_TIMEFRAME = os.getenv(
@@ -95,6 +95,12 @@ def get_user_settings(
 # ============================================================
 
 def get_pocket_symbols() -> list[str]:
+    """
+    Получить список инструментов, доступных в UI.
+
+    Техническое преобразование в Pocket Option identifier
+    выполняется внутри PocketOptionWebSocketClient.
+    """
 
     symbols: list[str] = []
 
@@ -446,17 +452,12 @@ async def analysis_command(
 
     status = forex_service.status()
 
-    websocket_status = status.get(
-        "websocket",
-        {},
-    )
-
-    connected = websocket_status.get(
+    connected = status.get(
         "connected",
         False,
     )
 
-    authenticated = websocket_status.get(
+    authenticated = status.get(
         "authenticated",
         False,
     )
@@ -506,23 +507,18 @@ async def status_command(
 
     status = forex_service.status()
 
-    websocket_status = status.get(
-        "websocket",
-        {},
-    )
-
-    connected = websocket_status.get(
+    connected = status.get(
         "connected",
         False,
     )
 
-    authenticated = websocket_status.get(
+    authenticated = status.get(
         "authenticated",
         False,
     )
 
-    running = websocket_status.get(
-        "running",
+    started = status.get(
+        "started",
         False,
     )
 
@@ -540,11 +536,25 @@ async def status_command(
 
     runtime_status = (
         "🟢 RUNNING"
-        if running
+        if started
         else "🔴 STOPPED"
     )
 
-    await message.answer(
+    subscriptions = status.get(
+        "subscriptions",
+        {},
+    )
+
+    known_symbols = status.get(
+        "known_symbols",
+        [],
+    )
+
+    last_error = status.get(
+        "last_error"
+    )
+
+    text = (
         "📋 СТАТУС СИСТЕМЫ\n\n"
 
         "🤖 Telegram Bot: 🟢 ONLINE\n\n"
@@ -557,13 +567,26 @@ async def status_command(
         "🧮 Indicator Engine: 🟢 ONLINE\n"
         "🤖 Signal Engine: 🟢 ONLINE\n\n"
 
-        f"📈 Ticks в буфере: "
-        f"{websocket_status.get('ticks_buffered', 0)}\n\n"
+        f"📈 Активные подписки: "
+        f"{len(subscriptions)}\n"
 
-        "⚠️ Аналитический режим.\n"
+        f"💱 Известных инструментов: "
+        f"{len(known_symbols)}\n"
+    )
+
+    if last_error:
+        text += (
+            "\n⚠️ Последняя ошибка:\n"
+            f"{last_error}\n"
+        )
+
+    text += (
+        "\n⚠️ Аналитический режим.\n"
         "Автоматическое открытие сделок "
         "отключено."
     )
+
+    await message.answer(text)
 
 
 # ============================================================
@@ -634,7 +657,7 @@ async def signal_callback(
         "⏳ Получаю рыночные данные...\n\n"
         f"💱 {symbol}\n"
         f"⏱ {timeframe}\n\n"
-        "🕯 Загружаю 500 свечей..."
+        "🕯 Загружаю до 500 свечей..."
     )
 
     try:
@@ -645,7 +668,15 @@ async def signal_callback(
             limit=500,
         )
 
+        if len(market.candles) < 50:
+            raise RuntimeError(
+                "Недостаточно свечей для технического анализа: "
+                f"{len(market.candles)}."
+            )
+
         await callback.message.answer(
+            f"🕯 Получено свечей: "
+            f"{len(market.candles)}\n\n"
             "🧮 Рассчитываю индикаторы..."
         )
 
@@ -694,17 +725,12 @@ async def analysis_callback(
 
     status = forex_service.status()
 
-    websocket_status = status.get(
-        "websocket",
-        {},
-    )
-
-    connected = websocket_status.get(
+    connected = status.get(
         "connected",
         False,
     )
 
-    authenticated = websocket_status.get(
+    authenticated = status.get(
         "authenticated",
         False,
     )
@@ -739,18 +765,18 @@ async def status_callback(
 
     status = forex_service.status()
 
-    websocket_status = status.get(
-        "websocket",
-        {},
-    )
-
-    connected = websocket_status.get(
+    connected = status.get(
         "connected",
         False,
     )
 
-    authenticated = websocket_status.get(
+    authenticated = status.get(
         "authenticated",
+        False,
+    )
+
+    started = status.get(
+        "started",
         False,
     )
 
@@ -760,23 +786,47 @@ async def status_callback(
         else "🔴 OFFLINE"
     )
 
-    await callback.message.answer(
+    runtime_status = (
+        "🟢 RUNNING"
+        if started
+        else "🔴 STOPPED"
+    )
+
+    subscriptions = status.get(
+        "subscriptions",
+        {},
+    )
+
+    known_symbols = status.get(
+        "known_symbols",
+        [],
+    )
+
+    text = (
         "📋 СТАТУС СИСТЕМЫ\n\n"
 
-        "🤖 Telegram Bot: 🟢 ONLINE\n"
-        f"📡 Pocket Option WebSocket: "
-        f"{market_status}\n"
-        f"🔐 Authentication: "
+        "🤖 Telegram Bot: 🟢 ONLINE\n\n"
+
+        "📡 Pocket Option WebSocket\n"
+        f"Connection: {market_status}\n"
+        f"Authentication: "
         f"{'🟢 OK' if authenticated else '🔴 NO'}\n"
+        f"Runtime: {runtime_status}\n\n"
+
         "🧮 Indicator Engine: 🟢 ONLINE\n"
         "🤖 Signal Engine: 🟢 ONLINE\n\n"
 
-        f"📈 Ticks в буфере: "
-        f"{websocket_status.get('ticks_buffered', 0)}\n\n"
+        f"📈 Активные подписки: "
+        f"{len(subscriptions)}\n"
+
+        f"💱 Известных инструментов: "
+        f"{len(known_symbols)}\n\n"
 
         "⚠️ Автоматическое открытие "
         "сделок отключено."
     )
+
+    await callback.message.answer(text)
 
     await callback.answer()
 
@@ -801,7 +851,7 @@ async def indicators_callback(
         "⏳ Получаю рыночные данные...\n\n"
         f"💱 {symbol}\n"
         f"⏱ {timeframe}\n\n"
-        "🕯 Загружаю 500 свечей..."
+        "🕯 Загружаю до 500 свечей..."
     )
 
     try:
@@ -812,7 +862,15 @@ async def indicators_callback(
             limit=500,
         )
 
+        if len(market.candles) < 50:
+            raise RuntimeError(
+                "Недостаточно свечей для расчёта "
+                f"индикаторов: {len(market.candles)}."
+            )
+
         await callback.message.answer(
+            f"🕯 Получено свечей: "
+            f"{len(market.candles)}\n\n"
             "🧮 Рассчитываю технические индикаторы..."
         )
 
@@ -1114,6 +1172,10 @@ async def main():
         # --------------------------------------------------------
 
         await forex_service.start()
+
+        print(
+            "Pocket Option WebSocket service started"
+        )
 
         # --------------------------------------------------------
         # Telegram polling.
