@@ -2,7 +2,8 @@ import asyncio
 import json
 import os
 import time
-from collections import deque
+from collections import defaultdict, deque
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 import aiohttp
@@ -18,1213 +19,800 @@ TickCallback = Callable[
 ] | None
 
 
+@dataclass(frozen=True)
+class PocketOptionTick:
+    symbol: str
+    timestamp: float
+    price: float
+
+
+@dataclass(frozen=True)
+class PocketOptionCandle:
+    timestamp: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+
+
 class PocketOptionWebSocketClient:
     """
-    Асинхронный клиент Pocket Option Socket.IO / Engine.IO.
+    Асинхронный клиент Pocket Option WebSocket.
 
     Архитектура:
 
-        Engine.IO
-            ↓
-        Socket.IO namespace
-            ↓
-        auth
-            ↓
-        auth/success
-            ↓
-        ticks / history
-            ↓
-        tick_callback
+        Pocket Option WebSocket
+                ↓
+        Engine.IO / Socket.IO
+                ↓
+        authentication
+                ↓
+        historical data
+                ↓
+        realtime ticks
+                ↓
+        candle aggregation
+                ↓
+        MarketData / ForexService
 
     ВАЖНО:
-
-    Этот клиент является ТОЛЬКО аналитическим транспортным слоем.
-
-    Он:
-        - подключается к WebSocket;
-        - авторизуется;
-        - получает рыночные данные;
-        - принимает ticks/history;
-        - позволяет подписаться на поток данных.
-
-    Он НЕ:
-        - открывает сделки;
-        - закрывает сделки;
-        - размещает ордера;
-        - содержит buy/sell/place_order;
-        - содержит торговый executor;
-        - передаёт сигналы в торговый API.
+    - клиент предназначен только для аналитики;
+    - торговые операции отсутствуют;
+    - нет buy/sell/order/TradeExecutor;
+    - единственный reader WebSocket находится внутри run();
+    - бинарные Socket.IO сообщения обрабатываются без
+      второго ws.receive()/ws.recv().
     """
 
     DEFAULT_WS_URL = (
-        "wss://api-spb.po.market/"
-        "socket.io/?EIO=4&transport=websocket"
+        "wss://api-spb.po.market/socket.io/"
+        "?EIO=4&transport=websocket"
     )
+
+    DEFAULT_LANG = "ru"
+    DEFAULT_CURRENT_URL = "cabinet/quick-high-low/USD"
+
+    ENGINE_PING_INTERVAL = 25.0
+    ENGINE_PING_TIMEOUT = 20.0
+
+    RECONNECT_MIN = 1.0
+    RECONNECT_MAX = 30.0
+
+    DEFAULT_TICK_BUFFER = 5000
+    DEFAULT_HISTORY_BUFFER = 5000
 
     def __init__(
         self,
-        websocket_url: str | None = None,
+        ws_url: str | None = None,
         ssid: str | None = None,
         uid: str | None = None,
-        lang: str | None = None,
-        current_url: str | None = None,
-        is_chart: int | None = None,
         tick_callback: TickCallback = None,
-        buffer_size: int = 10000,
     ) -> None:
-
-        # =====================================================================
-        # CONFIG
-        # =====================================================================
-
-        self.websocket_url = (
-            websocket_url
+        self.ws_url = (
+            ws_url
             or os.getenv("POCKET_OPTION_WS_URL")
             or self.DEFAULT_WS_URL
         )
 
-        # ВАЖНО:
-        # POCKET_OPTION_SSID содержит ТОЛЬКО raw sessionToken.
         self.ssid = (
             ssid
             or os.getenv("POCKET_OPTION_SSID")
+            or ""
         )
 
         self.uid = (
-            uid
-            or os.getenv("POCKET_OPTION_UID")
+            str(uid)
+            if uid is not None
+            else os.getenv("POCKET_OPTION_UID", "")
         )
 
         self.lang = (
-            lang
-            or os.getenv("POCKET_OPTION_LANG")
-            or "ru"
+            os.getenv("POCKET_OPTION_LANG")
+            or self.DEFAULT_LANG
         )
 
         self.current_url = (
-            current_url
-            or os.getenv("POCKET_OPTION_CURRENT_URL")
-            or "cabinet/quick-high-low/USD"
+            os.getenv("POCKET_OPTION_CURRENT_URL")
+            or self.DEFAULT_CURRENT_URL
         )
 
-        self.is_chart = (
-            is_chart
-            if is_chart is not None
-            else self._env_int(
-                "POCKET_OPTION_IS_CHART",
-                1,
-            )
+        self.is_chart = self._env_bool(
+            os.getenv("POCKET_OPTION_IS_CHART", "1")
         )
 
         self.tick_callback = tick_callback
 
-        # =====================================================================
-        # AIOHTTP
-        # =====================================================================
-
         self.session: aiohttp.ClientSession | None = None
         self.ws: aiohttp.ClientWebSocketResponse | None = None
 
-        # =====================================================================
-        # CONNECTION STATE
-        # =====================================================================
-
-        self.connected = False
-        self.namespace_connected = False
-        self.authenticated = False
-
-        self._running = False
+        self._runner_task: asyncio.Task[Any] | None = None
         self._stop_requested = False
+        self._connected = asyncio.Event()
+        self._authenticated = asyncio.Event()
 
-        # =====================================================================
-        # SOCKET.IO BINARY STATE
-        # =====================================================================
+        self._last_error: str | None = None
+        self._last_message_at: float | None = None
+        self._last_tick_at: float | None = None
 
-        self._binary_event_name: str | None = None
-        self._binary_event_payload: Any = None
-        self._binary_expected = 0
-        self._binary_received = 0
-        self._binary_attachments: dict[int, bytes] = {}
-
-        # =====================================================================
-        # DATA BUFFERS
-        # =====================================================================
-
-        self._ticks: deque[
-            tuple[str, float, float]
-        ] = deque(
-            maxlen=buffer_size
+        self._ticks: dict[str, deque[PocketOptionTick]] = defaultdict(
+            lambda: deque(maxlen=self.DEFAULT_TICK_BUFFER)
         )
 
-        self._last_tick: dict[
-            str,
-            tuple[float, float],
+        self._history: dict[
+            tuple[str, int],
+            deque[PocketOptionCandle],
+        ] = defaultdict(
+            lambda: deque(maxlen=self.DEFAULT_HISTORY_BUFFER)
+        )
+
+        self._pending_binary_event: dict[str, Any] | None = None
+        self._binary_attachments: list[bytes] = []
+
+        self._history_waiters: dict[
+            tuple[str, int],
+            list[asyncio.Future[list[PocketOptionCandle]]],
+        ] = defaultdict(list)
+
+        self._history_requests: dict[
+            tuple[str, int],
+            float,
         ] = {}
 
-        # =====================================================================
-        # TIME / DIAGNOSTICS
-        # =====================================================================
+        self._subscriptions: dict[str, set[int]] = defaultdict(set)
 
-        self._last_message_time = 0.0
-        self._last_tick_time = 0.0
-        self._authenticated_at = 0.0
+        self._known_symbols: set[str] = set()
 
-        self._subscriptions: set[str] = set()
+        self._server_time_offset = 0.0
 
-    # =========================================================================
-    # ENV
-    # =========================================================================
+    # ==========================================================================
+    # ENV / CONFIG
+    # ==========================================================================
 
     @staticmethod
-    def _env_int(
-        name: str,
-        default: int,
-    ) -> int:
-        value = os.getenv(name)
+    def _env_bool(value: str) -> bool:
+        return str(value).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
-        if value is None:
-            return default
+    @property
+    def is_connected(self) -> bool:
+        return (
+            self.ws is not None
+            and not self.ws.closed
+            and self._connected.is_set()
+        )
 
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
+    @property
+    def is_authenticated(self) -> bool:
+        return self._authenticated.is_set()
 
-    # =========================================================================
-    # CONNECT
-    # =========================================================================
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
+
+    # ==========================================================================
+    # SOCKET CONNECTION
+    # ==========================================================================
 
     async def connect(self) -> None:
         """
-        Создаёт WebSocket-соединение.
-
-        ВАЖНО:
-        connect() означает только установление WebSocket.
-
-        authenticated становится True только после:
-            42["auth/success"]
+        Установить WebSocket-соединение и выполнить Socket.IO auth.
         """
-
-        if not self.websocket_url:
-            raise PocketOptionWebSocketError(
-                "POCKET_OPTION_WS_URL is not configured"
-            )
+        if self.is_connected:
+            return
 
         if not self.ssid:
             raise PocketOptionWebSocketError(
-                "POCKET_OPTION_SSID is not configured"
+                "POCKET_OPTION_SSID is not configured."
             )
 
         if not self.uid:
             raise PocketOptionWebSocketError(
-                "POCKET_OPTION_UID is not configured"
+                "POCKET_OPTION_UID is not configured."
             )
 
-        await self.close()
+        self._stop_requested = False
+        self._last_error = None
 
-        self.session = aiohttp.ClientSession(
-            headers={
-                "Origin": "https://pocketoption.com",
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) "
-                    "Chrome/140.0 Safari/537.36"
-                ),
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-            }
-        )
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(
+                headers={
+                    "Origin": "https://pocketoption.com",
+                    "User-Agent": (
+                        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_1 "
+                        "like Mac OS X) AppleWebKit/605.1.15 "
+                        "(KHTML, like Gecko) Version/18.3 "
+                        "Mobile/15E148 Safari/604.1"
+                    ),
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                }
+            )
 
         try:
             self.ws = await self.session.ws_connect(
-                self.websocket_url,
+                self.ws_url,
                 heartbeat=None,
                 autoping=False,
                 receive_timeout=None,
-                max_msg_size=1_000_000,
             )
-
         except Exception as exc:
-            await self.close()
-
+            self._last_error = (
+                f"WebSocket connection failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
             raise PocketOptionWebSocketError(
-                f"WebSocket connection failed: {exc}"
+                self._last_error
             ) from exc
 
-        self.connected = True
-        self.namespace_connected = False
-        self.authenticated = False
+        self._connected.set()
 
-        self._reset_binary_state()
+        try:
+            await self._perform_engineio_handshake()
+            await self.send_auth()
+        except Exception:
+            await self._close_socket()
+            raise
 
-        print(
-            "~ Pocket Option WebSocket connected"
-        )
-        print(
-            f"  URL: {self.websocket_url}"
-        )
+    async def _perform_engineio_handshake(self) -> None:
+        """
+        Engine.IO EIO=4 handshake.
 
-    # =========================================================================
-    # CLOSE
-    # =========================================================================
+        Ожидаем:
 
-    async def close(self) -> None:
-        """Корректно закрывает WebSocket и HTTP session."""
+            0{"sid":...,"pingInterval":...}
 
-        self.connected = False
-        self.namespace_connected = False
-        self.authenticated = False
+        Затем отправляем:
 
-        self._reset_binary_state()
-
-        if self.ws is not None:
-            try:
-                await self.ws.close()
-            except Exception:
-                pass
-
-        self.ws = None
-
-        if self.session is not None:
-            try:
-                await self.session.close()
-            except Exception:
-                pass
-
-        self.session = None
-
-    # =========================================================================
-    # SEND TEXT
-    # =========================================================================
-
-    async def send_text(
-        self,
-        message: str,
-    ) -> None:
-        """Отправляет TEXT WebSocket frame."""
-
+            40
+        """
         if self.ws is None:
             raise PocketOptionWebSocketError(
-                "WebSocket is not connected"
+                "WebSocket is not connected."
             )
 
-        if self.ws.closed:
+        message = await self.ws.receive()
+
+        if message.type != aiohttp.WSMsgType.TEXT:
             raise PocketOptionWebSocketError(
-                "WebSocket is closed"
+                "Invalid Engine.IO handshake frame."
             )
 
-        await self.ws.send_str(message)
+        text = message.data
 
-    # =========================================================================
-    # ENGINE.IO PING/PONG
-    # =========================================================================
+        if not text.startswith("0"):
+            raise PocketOptionWebSocketError(
+                f"Unexpected Engine.IO handshake: {text[:200]}"
+            )
 
-    async def _send_engineio_pong(self) -> None:
-        """Отвечает на Engine.IO ping."""
+        try:
+            payload = json.loads(text[1:])
+        except json.JSONDecodeError as exc:
+            raise PocketOptionWebSocketError(
+                "Invalid Engine.IO handshake JSON."
+            ) from exc
 
-        await self.send_text("3")
+        if isinstance(payload, dict):
+            ping_interval = payload.get("pingInterval")
+            ping_timeout = payload.get("pingTimeout")
 
-    # =========================================================================
+            if ping_interval:
+                self.ENGINE_PING_INTERVAL = (
+                    float(ping_interval) / 1000.0
+                )
+
+            if ping_timeout:
+                self.ENGINE_PING_TIMEOUT = (
+                    float(ping_timeout) / 1000.0
+                )
+
+        await self._send_text("40")
+
+    # ==========================================================================
     # AUTH
-    # =========================================================================
+    # ==========================================================================
 
     async def send_auth(self) -> None:
         """
-        Отправляет АКТУАЛЬНЫЙ формат Pocket Option auth.
+        Browser-compatible Pocket Option auth.
 
-        Подтверждённый browser-пакет:
+        Авторизация:
 
-            42["auth",{
-                "sessionToken":"...",
-                "uid":"...",
-                "lang":"ru",
-                "currentUrl":"cabinet/quick-high-low/USD",
-                "isChart":1
-            }]
-
-        POCKET_OPTION_SSID должен содержать только raw sessionToken.
+        42["auth",{
+            "sessionToken":"...",
+            "uid":"...",
+            "lang":"ru",
+            "currentUrl":"cabinet/quick-high-low/USD",
+            "isChart":1
+        }]
         """
-
-        if not self.ssid:
-            raise PocketOptionWebSocketError(
-                "POCKET_OPTION_SSID is empty"
-            )
-
-        if not self.uid:
-            raise PocketOptionWebSocketError(
-                "POCKET_OPTION_UID is empty"
-            )
-
-        auth_payload = {
+        payload = {
             "sessionToken": self.ssid,
-            "uid": str(self.uid),
+            "uid": self.uid,
             "lang": self.lang,
             "currentUrl": self.current_url,
-            "isChart": self.is_chart,
+            "isChart": 1 if self.is_chart else 0,
         }
 
-        message = (
-            "42"
-            + json.dumps(
-                [
-                    "auth",
-                    auth_payload,
-                ],
-                separators=(",", ":"),
-                ensure_ascii=False,
+        await self._send_socketio(
+            "auth",
+            payload,
+        )
+
+    # ==========================================================================
+    # LOW LEVEL SEND
+    # ==========================================================================
+
+    async def _send_text(self, text: str) -> None:
+        if self.ws is None or self.ws.closed:
+            raise PocketOptionWebSocketError(
+                "WebSocket is not connected."
             )
-        )
 
-        await self.send_text(message)
+        await self.ws.send_str(text)
 
-        print(
-            "~ Pocket Option auth message sent"
-        )
-        print(
-            "  sessionToken: SET"
-        )
-        print(
-            f"  uid: {self.uid}"
-        )
-        print(
-            f"  lang: {self.lang}"
-        )
-        print(
-            f"  currentUrl: {self.current_url}"
-        )
-        print(
-            f"  isChart: {self.is_chart}"
-        )
+    async def _send_socketio(
+        self,
+        event: str,
+        payload: Any = None,
+    ) -> None:
+        if payload is None:
+            message = f'42["{event}"]'
+        else:
+            message = (
+                "42"
+                + json.dumps(
+                    [event, payload],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
 
-    # =========================================================================
-    # SUBSCRIBE
-    # =========================================================================
+        await self._send_text(message)
+
+    # ==========================================================================
+    # SUBSCRIPTION
+    # ==========================================================================
 
     async def subscribe(
         self,
         symbol: str,
+        timeframe_seconds: int = 60,
     ) -> None:
         """
-        Подписывается на поток рыночных данных.
+        Подписка на realtime поток.
 
-        Используется Socket.IO событие:
-
-            42["subfor","EURUSD_otc"]
-
-        Этот метод предназначен ТОЛЬКО для получения данных.
-        Торговых команд здесь нет.
+        Pocket Option использует технический asset id,
+        например EURUSD_otc.
         """
+        symbol = self.normalize_symbol(symbol)
 
-        symbol = str(symbol).strip()
+        timeframe_seconds = int(timeframe_seconds)
 
-        if not symbol:
-            raise PocketOptionWebSocketError(
-                "Cannot subscribe to empty symbol"
+        if timeframe_seconds <= 0:
+            raise ValueError(
+                "timeframe_seconds must be greater than zero."
             )
 
-        if not self.authenticated:
-            raise PocketOptionWebSocketError(
-                "Cannot subscribe before authentication"
-            )
+        await self._wait_until_authenticated()
 
-        payload = [
+        await self._send_socketio(
+            "changeSymbol",
+            {
+                "asset": symbol,
+                "period": timeframe_seconds,
+            },
+        )
+
+        await self._send_socketio(
             "subfor",
             symbol,
-        ]
-
-        message = (
-            "42"
-            + json.dumps(
-                payload,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            )
         )
 
-        await self.send_text(message)
-
-        self._subscriptions.add(symbol)
-
-        print(
-            "~ Subscribed to market data: "
-            f"{symbol}"
+        self._subscriptions[symbol].add(
+            timeframe_seconds
         )
 
-    async def unsubscribe(
+        self._known_symbols.add(symbol)
+
+    # ==========================================================================
+    # HISTORY REQUEST
+    # ==========================================================================
+
+    async def request_history(
         self,
         symbol: str,
-    ) -> None:
+        timeframe_seconds: int = 60,
+        *,
+        offset: int = 500,
+        timestamp: int | None = None,
+        timeout: float = 15.0,
+    ) -> list[PocketOptionCandle]:
         """
-        Удаляет символ из локального списка подписок.
+        Запрос исторических данных через loadHistoryPeriod.
 
-        Не отправляет торговых команд.
+        Формат запроса основан на наблюдаемом Pocket Option
+        Socket.IO протоколе:
+
+        42["loadHistoryPeriod",{
+            "asset":"EURUSD_otc",
+            "index":...,
+            "time":...,
+            "offset":...,
+            "period":60
+        }]
+
+        В ответ сервер может передать обычный JSON или
+        бинарный Socket.IO attachment.
         """
+        symbol = self.normalize_symbol(symbol)
+        timeframe_seconds = int(timeframe_seconds)
 
-        symbol = str(symbol).strip()
+        if timeframe_seconds <= 0:
+            raise ValueError(
+                "timeframe_seconds must be greater than zero."
+            )
 
-        if not symbol:
-            return
+        await self._wait_until_authenticated()
 
-        self._subscriptions.discard(symbol)
-
-        print(
-            "~ Local subscription removed: "
-            f"{symbol}"
+        await self.subscribe(
+            symbol,
+            timeframe_seconds,
         )
 
-    # =========================================================================
-    # RUN
-    # =========================================================================
+        if timestamp is None:
+            timestamp = int(
+                self.server_timestamp()
+            )
+
+        request = {
+            "asset": symbol,
+            "index": int(timestamp),
+            "time": int(timestamp),
+            "offset": int(offset),
+            "period": timeframe_seconds,
+        }
+
+        key = (
+            symbol,
+            timeframe_seconds,
+        )
+
+        future: asyncio.Future[
+            list[PocketOptionCandle]
+        ] = asyncio.get_running_loop().create_future()
+
+        self._history_waiters[key].append(future)
+        self._history_requests[key] = time.monotonic()
+
+        try:
+            await self._send_socketio(
+                "loadHistoryPeriod",
+                request,
+            )
+
+            try:
+                candles = await asyncio.wait_for(
+                    future,
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                candles = self.get_cached_candles(
+                    symbol,
+                    timeframe_seconds,
+                    limit=offset,
+                )
+
+            return candles
+
+        finally:
+            waiters = self._history_waiters.get(key)
+
+            if waiters and future in waiters:
+                waiters.remove(future)
+
+            if not waiters:
+                self._history_waiters.pop(
+                    key,
+                    None,
+                )
+
+    # ==========================================================================
+    # MAIN READER
+    # ==========================================================================
 
     async def run(self) -> None:
         """
-        Основной reader loop.
+        Единственный reader WebSocket.
 
-        ВАЖНО:
-        Только этот цикл читает WebSocket.
-
-        Никакие другие методы не вызывают ws.receive()/ws.recv().
-        Это необходимо для корректной обработки Socket.IO binary
-        attachments.
+        НИКАКИХ дополнительных ws.receive() внутри обработчиков.
         """
-
-        await self.connect()
-
-        self._running = True
-        self._stop_requested = False
+        if self.ws is None:
+            raise PocketOptionWebSocketError(
+                "WebSocket is not connected."
+            )
 
         try:
-            if self.ws is None:
-                raise PocketOptionWebSocketError(
-                    "WebSocket disappeared after connect"
-                )
-
             async for message in self.ws:
-
-                self._last_message_time = time.time()
+                self._last_message_at = time.time()
 
                 if message.type == aiohttp.WSMsgType.TEXT:
-
                     await self._handle_text(
                         message.data
                     )
 
                 elif message.type == aiohttp.WSMsgType.BINARY:
-
                     await self._handle_binary(
                         message.data
                     )
 
-                elif message.type == aiohttp.WSMsgType.PING:
-
-                    print(
-                        "< WebSocket PING"
-                    )
-
-                    if self.ws is not None:
-                        await self.ws.pong()
-
-                elif message.type == aiohttp.WSMsgType.PONG:
-
-                    print(
-                        "< WebSocket PONG"
-                    )
-
-                elif message.type == aiohttp.WSMsgType.CLOSE:
-
-                    print(
-                        "< WebSocket CLOSE"
-                    )
-
-                    break
-
                 elif message.type == aiohttp.WSMsgType.CLOSED:
-
-                    print(
-                        "< WebSocket CLOSED"
-                    )
-
                     break
 
                 elif message.type == aiohttp.WSMsgType.ERROR:
-
-                    error = (
-                        self.ws.exception()
-                        if self.ws is not None
-                        else None
+                    raise PocketOptionWebSocketError(
+                        "WebSocket error frame received."
                     )
 
-                    print(
-                        "x WebSocket error: "
-                        f"{error}"
-                    )
+        except asyncio.CancelledError:
+            raise
 
-                    break
+        except Exception as exc:
+            self._last_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise
 
         finally:
+            self._connected.clear()
+            self._authenticated.clear()
 
-            self._running = False
-
-            await self.close()
-
-    # =========================================================================
-    # RUN FOREVER
-    # =========================================================================
-
-    async def run_forever(
-        self,
-        reconnect_delay: float = 3.0,
-        max_reconnect_delay: float = 30.0,
-    ) -> None:
-        """
-        Работает с автоматическим reconnect.
-
-        После переподключения авторизация выполняется заново.
-        Подписки хранятся локально и могут быть восстановлены
-        после auth/success.
-        """
-
-        self._stop_requested = False
-
-        current_delay = max(
-            0.5,
-            reconnect_delay,
-        )
-
-        while not self._stop_requested:
-
-            try:
-
-                await self.run()
-
-                current_delay = max(
-                    0.5,
-                    reconnect_delay,
-                )
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as exc:
-
-                print(
-                    "x Pocket Option WebSocket error: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-            if self._stop_requested:
-                break
-
-            print(
-                "t Reconnecting in "
-                f"{current_delay:.1f}s..."
-            )
-
-            try:
-                await asyncio.sleep(
-                    current_delay
-                )
-            except asyncio.CancelledError:
-                raise
-
-            current_delay = min(
-                current_delay * 2,
-                max_reconnect_delay,
-            )
-
-    # =========================================================================
-    # STOP
-    # =========================================================================
-
-    async def stop(self) -> None:
-        """Останавливает client."""
-
-        self._stop_requested = True
-
-        await self.close()
-
-    # =========================================================================
-    # HANDLE TEXT
-    # =========================================================================
+    # ==========================================================================
+    # TEXT FRAME HANDLING
+    # ==========================================================================
 
     async def _handle_text(
         self,
-        data: str,
+        text: str,
     ) -> None:
-        """
-        Обрабатывает Engine.IO / Socket.IO TEXT frames.
-        """
-
-        if not data:
+        if not text:
             return
 
-        preview = data[:500]
-
-        # Не печатаем потенциально чувствительные auth-пакеты
-        # целиком.
-        if data.startswith('42["auth"'):
-            print(
-                "+ TEXT Socket.IO auth packet"
-            )
-        else:
-            print(
-                f"+ TEXT {preview}"
-            )
-
-        # =====================================================================
-        # ENGINE.IO OPEN
-        # =====================================================================
-
-        if data.startswith("0"):
-
-            print(
-                "~ Engine.IO OPEN"
-            )
-
-            try:
-                engine_data = json.loads(
-                    data[1:]
-                )
-
-                if isinstance(
-                    engine_data,
-                    dict,
-                ):
-                    print(
-                        "  pingInterval:",
-                        engine_data.get(
-                            "pingInterval"
-                        ),
-                    )
-                    print(
-                        "  pingTimeout:",
-                        engine_data.get(
-                            "pingTimeout"
-                        ),
-                    )
-                    print(
-                        "  maxPayload:",
-                        engine_data.get(
-                            "maxPayload"
-                        ),
-                    )
-
-            except json.JSONDecodeError:
-                print(
-                    "~ Engine.IO OPEN payload "
-                    "could not be parsed"
-                )
-
-            await self.send_text("40")
-
+        # Engine.IO ping
+        if text == "2":
+            await self._send_text("3")
             return
 
-        # =====================================================================
-        # ENGINE.IO PING
-        # =====================================================================
-
-        if data == "2":
-
-            print(
-                "< Engine.IO PING"
-            )
-
-            await self._send_engineio_pong()
-
+        # Engine.IO pong
+        if text == "3":
             return
 
-        # =====================================================================
-        # ENGINE.IO PONG
-        # =====================================================================
-
-        if data == "3":
-
-            print(
-                "< Engine.IO PONG"
-            )
-
+        # Socket.IO connect
+        if text == "40":
             return
 
-        # =====================================================================
-        # SOCKET.IO NAMESPACE
-        # =====================================================================
-
-        if data.startswith("40"):
-
-            self.namespace_connected = True
-
-            print(
-                "~ Socket.IO namespace connected"
-            )
-
-            await self.send_auth()
-
+        # Socket.IO connect + payload
+        if text.startswith("40"):
+            self._authenticated.set()
             return
 
-        # =====================================================================
-        # SOCKET.IO EVENT
-        # =====================================================================
-
-        if data.startswith("42"):
-
-            await self._parse_socketio_event(
-                data
+        # Socket.IO event
+        if text.startswith("42"):
+            await self._handle_socketio_event(
+                text[2:]
             )
-
             return
 
-        # =====================================================================
-        # SOCKET.IO BINARY EVENT HEADER
-        # =====================================================================
-
-        if data.startswith("45"):
-
-            await self._parse_binary_event_header(
-                data
+        # Binary Socket.IO event header
+        if text.startswith("45"):
+            await self._handle_binary_header(
+                text
             )
-
             return
 
-        # =====================================================================
-        # SOCKET.IO DISCONNECT
-        # =====================================================================
-
-        if data.startswith("41"):
-
-            self.namespace_connected = False
-            self.authenticated = False
-
-            print(
-                "x Socket.IO namespace disconnected"
-            )
-
+        # Some servers may send Engine.IO open
+        # after reconnect.
+        if text.startswith("0"):
             return
 
-        print(
-            "< Unhandled TEXT frame: "
-            f"{preview}"
-        )
-
-    # =========================================================================
-    # SOCKET.IO EVENT
-    # =========================================================================
-
-    async def _parse_socketio_event(
+    async def _handle_socketio_event(
         self,
-        data: str,
+        payload_text: str,
     ) -> None:
-        """Разбирает обычный Socket.IO event."""
-
-        payload = data[2:]
-
         try:
-
-            event = json.loads(
-                payload
-            )
-
+            payload = json.loads(payload_text)
         except json.JSONDecodeError:
-
-            print(
-                "x Invalid Socket.IO JSON: "
-                f"{payload[:500]}"
-            )
-
             return
 
-        if not isinstance(event, list):
+        if not isinstance(payload, list):
             return
 
-        if not event:
+        if not payload:
             return
 
-        event_name = event[0]
+        event = payload[0]
 
-        if not isinstance(
-            event_name,
-            str,
-        ):
-            return
-
-        print(
-            "< Socket.IO event: "
-            f"{event_name}"
+        data = (
+            payload[1]
+            if len(payload) > 1
+            else None
         )
 
-        # =====================================================================
-        # AUTH SUCCESS
-        # =====================================================================
-
-        if event_name in {
+        if event in {
             "auth/success",
             "successauth",
+            "successAuth",
         }:
-
-            self.authenticated = True
-            self._authenticated_at = time.time()
-
-            print(
-                "✓ Pocket Option authentication SUCCESS"
-            )
-
-            # После reconnect восстанавливаем подписки.
-            if self._subscriptions:
-
-                subscriptions = list(
-                    self._subscriptions
-                )
-
-                self._subscriptions.clear()
-
-                for symbol in subscriptions:
-
-                    try:
-                        await self.subscribe(
-                            symbol
-                        )
-                    except Exception as exc:
-                        print(
-                            "x Subscription restore failed "
-                            f"for {symbol}: {exc}"
-                        )
-
+            self._authenticated.set()
             return
 
-        # =====================================================================
-        # AUTH FAILURE
-        # =====================================================================
-
-        if event_name in {
+        if event in {
+            "auth/fail",
             "auth/error",
-            "auth/failed",
             "NotAuthorized",
         }:
-
-            self.authenticated = False
-
-            print(
-                "x Pocket Option authentication FAILED"
+            self._authenticated.clear()
+            self._last_error = (
+                f"Pocket Option authentication failed: "
+                f"{data}"
             )
-
-            if len(event) > 1:
-
-                print(
-                    "  reason:",
-                    self._safe_preview(
-                        event[1],
-                        500,
-                    ),
-                )
-
             return
 
-        # =====================================================================
-        # UPDATE STREAM
-        # =====================================================================
-
-        if event_name == "updateStream":
-
-            if len(event) > 1:
-
-                ticks = self._extract_stream_ticks(
-                    event[1]
-                )
-
-                for (
-                    symbol,
-                    timestamp,
-                    price,
-                ) in ticks:
-
-                    await self._emit_tick(
-                        symbol,
-                        timestamp,
-                        price,
-                    )
-
+        if event in {
+            "updateStream",
+            "updateCloseValue",
+        }:
+            await self._handle_stream_payload(
+                data
+            )
             return
 
-        # =====================================================================
-        # HISTORY
-        # =====================================================================
-
-        if event_name == "updateHistoryNewFast":
-
-            if len(event) > 1:
-
-                ticks = self._extract_history_ticks(
-                    event[1]
-                )
-
-                for (
-                    symbol,
-                    timestamp,
-                    price,
-                ) in ticks:
-
-                    await self._emit_tick(
-                        symbol,
-                        timestamp,
-                        price,
-                    )
-
+        if event in {
+            "updateHistoryNewFast",
+            "loadHistoryPeriod",
+            "loadHistoryPeriodFast",
+            "history",
+        }:
+            await self._handle_history_payload(
+                data
+            )
             return
 
-        # =====================================================================
-        # UNKNOWN
-        # =====================================================================
+        if event == "disconnect":
+            self._connected.clear()
+            self._authenticated.clear()
+            return
 
-        print(
-            "~ Unhandled Socket.IO event: "
-            f"{event_name}"
-        )
+    # ==========================================================================
+    # BINARY SOCKET.IO
+    # ==========================================================================
 
-    # =========================================================================
-    # BINARY HEADER
-    # =========================================================================
-
-    async def _parse_binary_event_header(
+    async def _handle_binary_header(
         self,
-        data: str,
+        text: str,
     ) -> None:
         """
-        Регистрирует Socket.IO binary event.
-
         Пример:
 
-            451-["updateStream",{
-                "_placeholder":true,
-                "num":0
-            }]
+            451-[...]
 
-        ВАЖНО:
-        Здесь НЕТ ws.recv().
-
-        Следующий binary frame будет получен тем же
-        основным reader loop и попадёт в _handle_binary().
+        где:
+            45 = Engine.IO binary message
+            1  = Socket.IO attachment count
         """
+        if not text.startswith("45"):
+            return
 
-        separator = data.find("-")
+        separator = text.find("-")
 
         if separator < 0:
-
-            print(
-                "x Invalid Socket.IO binary header"
-            )
-
             return
-
-        # Для Socket.IO packet:
-        #
-        # 45 + <attachment_count> + "-"
-        #
-        # Например:
-        #
-        # 451-...
-        #
-        attachment_count_text = data[
-            2:separator
-        ]
 
         try:
-
             attachment_count = int(
-                attachment_count_text
+                text[2:separator]
             )
-
         except ValueError:
-
-            print(
-                "x Invalid binary attachment count: "
-                f"{attachment_count_text}"
-            )
-
             return
 
-        json_part = data[
+        header_text = text[
             separator + 1:
         ]
 
         try:
-
-            event = json.loads(
-                json_part
+            payload = json.loads(
+                header_text
             )
-
         except json.JSONDecodeError:
-
-            print(
-                "x Invalid binary event JSON"
-            )
-
             return
 
-        if not isinstance(
-            event,
-            list,
-        ):
-            return
+        self._pending_binary_event = {
+            "payload": payload,
+            "attachments": attachment_count,
+        }
 
-        if not event:
-            return
+        self._binary_attachments = []
 
-        event_name = event[0]
-
-        if not isinstance(
-            event_name,
-            str,
-        ):
-            return
-
-        payload = (
-            event[1]
-            if len(event) > 1
-            else None
-        )
-
-        self._binary_event_name = event_name
-        self._binary_event_payload = payload
-        self._binary_expected = attachment_count
-        self._binary_received = 0
-        self._binary_attachments = {}
-
-        print(
-            "~ Binary Socket.IO event registered: "
-            f"{event_name}"
-        )
-        print(
-            "  expected attachments:",
-            attachment_count,
-        )
-
-        # Теоретически Socket.IO может прислать binary packet
-        # с нулевым количеством attachments.
         if attachment_count == 0:
-
-            self._reset_binary_state()
-
-            await self._process_payload(
-                event_name,
-                payload,
-            )
-
-    # =========================================================================
-    # HANDLE BINARY
-    # =========================================================================
+            await self._process_binary_event()
 
     async def _handle_binary(
         self,
         data: bytes,
     ) -> None:
-        """
-        Принимает один Socket.IO binary attachment.
-
-        Этот метод вызывается только основным reader loop.
-        """
-
-        print(
-            "< BINARY attachment: "
-            f"{len(data)} bytes"
-        )
-
-        if (
-            self._binary_expected <= 0
-            or self._binary_event_name is None
-        ):
-
-            print(
-                "x Binary attachment received "
-                "without pending Socket.IO event"
+        if self._pending_binary_event is None:
+            decoded = self._decode_possible_binary_json(
+                data
             )
 
+            if decoded is not None:
+                await self._handle_decoded_binary(
+                    decoded
+                )
+
             return
 
-        attachment_index = (
-            self._binary_received
+        self._binary_attachments.append(data)
+
+        expected = int(
+            self._pending_binary_event[
+                "attachments"
+            ]
         )
-
-        self._binary_attachments[
-            attachment_index
-        ] = data
-
-        self._binary_received += 1
 
         if (
-            self._binary_received
-            < self._binary_expected
+            len(self._binary_attachments)
+            >= expected
         ):
+            await self._process_binary_event()
+
+    async def _process_binary_event(
+        self,
+    ) -> None:
+        if self._pending_binary_event is None:
             return
 
-        event_name = (
-            self._binary_event_name
-        )
+        payload = self._pending_binary_event[
+            "payload"
+        ]
 
-        payload = (
-            self._binary_event_payload
-        )
-
-        attachments = dict(
+        attachments = (
             self._binary_attachments
         )
 
-        self._reset_binary_state()
+        self._pending_binary_event = None
+        self._binary_attachments = []
 
-        resolved_payload = (
-            self._replace_binary_placeholders(
-                payload,
-                attachments,
-            )
+        payload = self._replace_binary_placeholders(
+            payload,
+            attachments,
         )
 
-        await self._process_payload(
-            event_name,
-            resolved_payload,
+        await self._handle_decoded_binary(
+            payload
         )
-
-    # =========================================================================
-    # PLACEHOLDERS
-    # =========================================================================
 
     @classmethod
     def _replace_binary_placeholders(
         cls,
         value: Any,
-        attachments: dict[int, bytes],
+        attachments: list[bytes],
     ) -> Any:
-        """
-        Рекурсивно заменяет Socket.IO placeholders:
-
-            {
-                "_placeholder": true,
-                "num": 0
-            }
-
-        на соответствующий bytes attachment.
-        """
-
         if isinstance(value, dict):
+            if value.get("_placeholder") is True:
+                number = value.get("num")
 
-            if (
-                value.get("_placeholder") is True
-                and "num" in value
-            ):
-
-                try:
-                    number = int(
-                        value["num"]
-                    )
-                except (
-                    TypeError,
-                    ValueError,
+                if (
+                    isinstance(number, int)
+                    and 0 <= number < len(attachments)
                 ):
-                    return value
+                    return attachments[number]
 
-                return attachments.get(
-                    number,
-                    value,
-                )
+                return value
 
             return {
                 key: cls._replace_binary_placeholders(
@@ -1235,7 +823,6 @@ class PocketOptionWebSocketClient:
             }
 
         if isinstance(value, list):
-
             return [
                 cls._replace_binary_placeholders(
                     item,
@@ -1244,390 +831,135 @@ class PocketOptionWebSocketClient:
                 for item in value
             ]
 
-        if isinstance(value, tuple):
-
-            return tuple(
-                cls._replace_binary_placeholders(
-                    item,
-                    attachments,
-                )
-                for item in value
-            )
-
         return value
-
-    # =========================================================================
-    # PROCESS PAYLOAD
-    # =========================================================================
-
-    async def _process_payload(
-        self,
-        event_name: str,
-        payload: Any,
-    ) -> None:
-        """
-        Обрабатывает уже собранный Socket.IO payload.
-        """
-
-        if event_name == "updateStream":
-
-            decoded_payload = (
-                self._decode_possible_binary_json(
-                    payload
-                )
-            )
-
-            ticks = self._extract_stream_ticks(
-                decoded_payload
-            )
-
-            for (
-                symbol,
-                timestamp,
-                price,
-            ) in ticks:
-
-                await self._emit_tick(
-                    symbol,
-                    timestamp,
-                    price,
-                )
-
-            return
-
-        if event_name == "updateHistoryNewFast":
-
-            decoded_payload = (
-                self._decode_possible_binary_json(
-                    payload
-                )
-            )
-
-            ticks = self._extract_history_ticks(
-                decoded_payload
-            )
-
-            for (
-                symbol,
-                timestamp,
-                price,
-            ) in ticks:
-
-                await self._emit_tick(
-                    symbol,
-                    timestamp,
-                    price,
-                )
-
-            return
-
-        print(
-            "~ Unknown binary event payload: "
-            f"{event_name}"
-        )
-
-        print(
-            "  payload:",
-            self._safe_preview(
-                payload,
-                1000,
-            ),
-        )
-
-    # =========================================================================
-    # DECODE BINARY JSON
-    # =========================================================================
 
     @staticmethod
     def _decode_possible_binary_json(
-        value: Any,
-    ) -> Any:
-        """
-        Пытается декодировать bytes как UTF-8 JSON.
-
-        Если binary payload не является UTF-8 JSON,
-        возвращает исходные bytes.
-
-        Это намеренно НЕ делает предположений о неизвестном
-        бинарном формате Pocket Option.
-        """
-
-        if not isinstance(
-            value,
-            (bytes, bytearray),
-        ):
-            return value
-
-        raw = bytes(value)
+        data: bytes,
+    ) -> Any | None:
+        if not data:
+            return None
 
         try:
-
-            text = raw.decode(
+            text = data.decode(
                 "utf-8"
             )
-
         except UnicodeDecodeError:
+            return None
 
-            return raw
+        text = text.strip()
+
+        if not text:
+            return None
 
         try:
-
-            return json.loads(
-                text
-            )
-
+            return json.loads(text)
         except json.JSONDecodeError:
+            return None
 
-            return raw
-
-    # =========================================================================
-    # EXTRACT STREAM TICKS
-    # =========================================================================
-
-    @staticmethod
-    def _extract_stream_ticks(
+    async def _handle_decoded_binary(
+        self,
         payload: Any,
-    ) -> list[
-        tuple[str, float, float]
-    ]:
-        """
-        Извлекает ticks из updateStream.
-
-        Поддерживаемый подтверждённый формат:
-
-            [
-                [
-                    "CHF NOK_otc",
-                    1786750548.048,
-                    8.958
-                ]
-            ]
-
-        Также поддерживается одиночный tick.
-        """
-
-        result: list[
-            tuple[str, float, float]
-        ] = []
-
-        if isinstance(
-            payload,
-            (bytes, bytearray),
-        ):
-            return result
-
-        if not isinstance(
-            payload,
-            list,
-        ):
-            return result
-
-        # ---------------------------------------------------------------------
-        # Один tick:
-        #
-        # ["EURUSD_otc", timestamp, price]
-        # ---------------------------------------------------------------------
-
-        if (
-            len(payload) >= 3
-            and isinstance(
-                payload[0],
-                str,
-            )
-        ):
-
-            try:
-
-                result.append(
-                    (
-                        payload[0],
-                        float(payload[1]),
-                        float(payload[2]),
-                    )
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-                pass
-
-            return result
-
-        # ---------------------------------------------------------------------
-        # Список ticks:
-        #
-        # [
-        #   ["EURUSD_otc", timestamp, price],
-        #   ...
-        # ]
-        # ---------------------------------------------------------------------
-
-        for item in payload:
-
-            if not isinstance(
-                item,
-                list,
-            ):
-                continue
-
-            if len(item) < 3:
-                continue
-
-            symbol = item[0]
-
-            if not isinstance(
-                symbol,
-                str,
-            ):
-                continue
-
-            try:
-
-                timestamp = float(
-                    item[1]
-                )
-
-                price = float(
-                    item[2]
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-                continue
-
-            result.append(
-                (
-                    symbol,
-                    timestamp,
-                    price,
-                )
-            )
-
-        return result
-
-    # =========================================================================
-    # EXTRACT HISTORY
-    # =========================================================================
-
-    @staticmethod
-    def _extract_history_ticks(
-        payload: Any,
-    ) -> list[
-        tuple[str, float, float]
-    ]:
-        """
-        Извлекает историю.
-
-        Поддерживаемые форматы:
-
-        1.
-            [
-                ["EURUSD_otc", timestamp, price],
-                ...
-            ]
-
-        2.
-            {
-                "asset": "CHF NOK_otc",
-                "period": 60,
-                "history": [
-                    [timestamp, price],
-                    ...
-                ]
-            }
-        """
-
-        result: list[
-            tuple[str, float, float]
-        ] = []
-
-        if isinstance(
-            payload,
-            (bytes, bytearray),
-        ):
-            return result
-
-        # =====================================================================
-        # LIST
-        # =====================================================================
-
-        if isinstance(
-            payload,
-            list,
-        ):
-
-            # Один tick.
+    ) -> None:
+        if isinstance(payload, list):
             if (
-                len(payload) >= 3
-                and isinstance(
-                    payload[0],
-                    str,
-                )
+                len(payload) >= 2
+                and isinstance(payload[0], str)
             ):
+                event = payload[0]
+                data = payload[1]
+
+                if event in {
+                    "updateStream",
+                    "updateCloseValue",
+                }:
+                    await self._handle_stream_payload(
+                        data
+                    )
+                    return
+
+                if event in {
+                    "updateHistoryNewFast",
+                    "loadHistoryPeriod",
+                    "loadHistoryPeriodFast",
+                    "history",
+                }:
+                    await self._handle_history_payload(
+                        data
+                    )
+                    return
+
+        await self._handle_history_payload(
+            payload
+        )
+
+    # ==========================================================================
+    # STREAM PARSING
+    # ==========================================================================
+
+    async def _handle_stream_payload(
+        self,
+        payload: Any,
+    ) -> None:
+        ticks = self._extract_stream_ticks(
+            payload
+        )
+
+        for tick in ticks:
+            await self._store_tick(
+                tick
+            )
+
+    def _extract_stream_ticks(
+        self,
+        payload: Any,
+    ) -> list[PocketOptionTick]:
+        result: list[PocketOptionTick] = []
+
+        def add_item(item: Any) -> None:
+            if (
+                isinstance(item, list)
+                and len(item) >= 3
+                and isinstance(item[0], str)
+            ):
+                symbol = self.normalize_symbol(
+                    item[0]
+                )
 
                 try:
-
-                    result.append(
-                        (
-                            payload[0],
-                            float(payload[1]),
-                            float(payload[2]),
-                        )
-                    )
-
+                    timestamp = float(item[1])
+                    price = float(item[2])
                 except (
                     TypeError,
                     ValueError,
                 ):
-                    pass
+                    return
 
-                return result
+                if timestamp <= 0 or price <= 0:
+                    return
 
-            # Список ticks.
+                result.append(
+                    PocketOptionTick(
+                        symbol=symbol,
+                        timestamp=timestamp,
+                        price=price,
+                    )
+                )
+
+        if isinstance(payload, list):
             for item in payload:
-
                 if (
-                    isinstance(
-                        item,
-                        list,
-                    )
+                    isinstance(item, list)
                     and len(item) >= 3
-                    and isinstance(
-                        item[0],
-                        str,
-                    )
+                    and isinstance(item[0], str)
                 ):
+                    add_item(item)
 
-                    try:
+                elif isinstance(item, list):
+                    for nested in item:
+                        add_item(nested)
 
-                        result.append(
-                            (
-                                item[0],
-                                float(item[1]),
-                                float(item[2]),
-                            )
-                        )
-
-                    except (
-                        TypeError,
-                        ValueError,
-                    ):
-                        continue
-
-            return result
-
-        # =====================================================================
-        # DICT
-        # =====================================================================
-
-        if isinstance(
-            payload,
-            dict,
-        ):
-
+        elif isinstance(payload, dict):
             symbol = (
                 payload.get("asset")
                 or payload.get("symbol")
@@ -1637,413 +969,941 @@ class PocketOptionWebSocketClient:
                 "history"
             )
 
-            if not isinstance(
-                symbol,
-                str,
+            if (
+                isinstance(symbol, str)
+                and isinstance(history, list)
             ):
-                return result
+                for item in history:
+                    if (
+                        isinstance(item, list)
+                        and len(item) >= 2
+                    ):
+                        try:
+                            timestamp = float(
+                                item[0]
+                            )
+                            price = float(
+                                item[1]
+                            )
+                        except (
+                            TypeError,
+                            ValueError,
+                        ):
+                            continue
 
-            if not isinstance(
-                history,
-                list,
-            ):
-                return result
+                        if (
+                            timestamp > 0
+                            and price > 0
+                        ):
+                            result.append(
+                                PocketOptionTick(
+                                    symbol=self.normalize_symbol(
+                                        symbol
+                                    ),
+                                    timestamp=timestamp,
+                                    price=price,
+                                )
+                            )
 
-            for item in history:
+        return result
 
-                if (
-                    not isinstance(
-                        item,
-                        list,
-                    )
-                    or len(item) < 2
-                ):
-                    continue
+    async def _store_tick(
+        self,
+        tick: PocketOptionTick,
+    ) -> None:
+        self._ticks[tick.symbol].append(
+            tick
+        )
 
+        self._known_symbols.add(
+            tick.symbol
+        )
+
+        self._last_tick_at = time.time()
+
+        self._update_candles_from_tick(
+            tick
+        )
+
+        if self.tick_callback is not None:
+            try:
+                await self.tick_callback(
+                    tick.symbol,
+                    tick.timestamp,
+                    tick.price,
+                )
+            except Exception:
+                # Callback must not kill the WebSocket reader.
+                pass
+
+    # ==========================================================================
+    # HISTORY PARSING
+    # ==========================================================================
+
+    async def _handle_history_payload(
+        self,
+        payload: Any,
+    ) -> None:
+        candles: list[PocketOptionCandle] = []
+
+        symbol: str | None = None
+        period: int | None = None
+
+        if isinstance(payload, dict):
+            raw_symbol = (
+                payload.get("asset")
+                or payload.get("symbol")
+            )
+
+            if isinstance(raw_symbol, str):
+                symbol = self.normalize_symbol(
+                    raw_symbol
+                )
+
+            raw_period = (
+                payload.get("period")
+                or payload.get("timeframe")
+            )
+
+            if raw_period is not None:
                 try:
-
-                    timestamp = float(
-                        item[0]
+                    period = int(
+                        raw_period
                     )
-
-                    price = float(
-                        item[1]
-                    )
-
                 except (
                     TypeError,
                     ValueError,
                 ):
-                    continue
+                    period = None
 
-                result.append(
-                    (
-                        symbol,
-                        timestamp,
-                        price,
+            raw_candles = payload.get(
+                "candles"
+            )
+
+            if isinstance(
+                raw_candles,
+                list,
+            ):
+                candles.extend(
+                    self._parse_candle_array(
+                        raw_candles,
+                        period,
                     )
                 )
 
+            raw_history = payload.get(
+                "history"
+            )
+
+            if isinstance(
+                raw_history,
+                list,
+            ):
+                candles.extend(
+                    self._ticks_to_candles(
+                        symbol,
+                        raw_history,
+                        period,
+                    )
+                )
+
+        elif isinstance(payload, list):
+            candles.extend(
+                self._parse_candle_array(
+                    payload,
+                    period,
+                )
+            )
+
+        candles = self._deduplicate_candles(
+            candles
+        )
+
+        if not candles:
+            return
+
+        if symbol is None:
+            symbol = candles[0].__dict__.get(
+                "symbol"
+            )
+
+        if symbol is None:
+            return
+
+        if period is None:
+            period = self._infer_period(
+                symbol
+            )
+
+        key = (
+            symbol,
+            int(period),
+        )
+
+        existing = self._history[key]
+
+        merged = {
+            candle.timestamp: candle
+            for candle in existing
+        }
+
+        for candle in candles:
+            merged[
+                candle.timestamp
+            ] = candle
+
+        ordered = sorted(
+            merged.values(),
+            key=lambda candle: candle.timestamp,
+        )
+
+        existing.clear()
+        existing.extend(
+            ordered[
+                -self.DEFAULT_HISTORY_BUFFER:
+            ]
+        )
+
+        self._resolve_history_waiters(
+            key,
+            list(existing),
+        )
+
+    def _parse_candle_array(
+        self,
+        values: list[Any],
+        period: int | None,
+    ) -> list[PocketOptionCandle]:
+        result: list[PocketOptionCandle] = []
+
+        for item in values:
+            if not isinstance(item, list):
+                continue
+
+            if len(item) < 5:
+                continue
+
+            try:
+                timestamp = int(
+                    float(item[0])
+                )
+
+                open_price = float(
+                    item[1]
+                )
+
+                close_price = float(
+                    item[2]
+                )
+
+                high_price = float(
+                    item[3]
+                )
+
+                low_price = float(
+                    item[4]
+                )
+
+                volume = (
+                    float(item[5])
+                    if len(item) > 5
+                    else 0.0
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            if timestamp <= 0:
+                continue
+
+            if min(
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+            ) <= 0:
+                continue
+
+            high_price = max(
+                high_price,
+                open_price,
+                close_price,
+            )
+
+            low_price = min(
+                low_price,
+                open_price,
+                close_price,
+            )
+
+            result.append(
+                PocketOptionCandle(
+                    timestamp=timestamp,
+                    open=open_price,
+                    high=high_price,
+                    low=low_price,
+                    close=close_price,
+                    volume=max(
+                        volume,
+                        0.0,
+                    ),
+                )
+            )
+
         return result
 
-    # =========================================================================
-    # EMIT TICK
-    # =========================================================================
+    def _ticks_to_candles(
+        self,
+        symbol: str | None,
+        values: list[Any],
+        period: int | None,
+    ) -> list[PocketOptionCandle]:
+        if not symbol:
+            return []
 
-    async def _emit_tick(
+        if not period or period <= 0:
+            period = 60
+
+        ticks: list[
+            PocketOptionTick
+        ] = []
+
+        for item in values:
+            if (
+                not isinstance(item, list)
+                or len(item) < 2
+            ):
+                continue
+
+            try:
+                timestamp = float(
+                    item[0]
+                )
+                price = float(
+                    item[1]
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            if (
+                timestamp <= 0
+                or price <= 0
+            ):
+                continue
+
+            ticks.append(
+                PocketOptionTick(
+                    symbol=symbol,
+                    timestamp=timestamp,
+                    price=price,
+                )
+            )
+
+        return self._aggregate_ticks(
+            ticks,
+            period,
+        )
+
+    # ==========================================================================
+    # CANDLE AGGREGATION
+    # ==========================================================================
+
+    def _update_candles_from_tick(
+        self,
+        tick: PocketOptionTick,
+    ) -> None:
+        for period in self._subscriptions.get(
+            tick.symbol,
+            set(),
+        ):
+            candle = self._aggregate_single_tick(
+                tick,
+                period,
+            )
+
+            if candle is None:
+                continue
+
+            key = (
+                tick.symbol,
+                period,
+            )
+
+            existing = self._history[key]
+
+            if (
+                existing
+                and existing[-1].timestamp
+                == candle.timestamp
+            ):
+                existing[-1] = candle
+
+            else:
+                existing.append(
+                    candle
+                )
+
+    @staticmethod
+    def _aggregate_single_tick(
+        tick: PocketOptionTick,
+        period: int,
+    ) -> PocketOptionCandle | None:
+        if period <= 0:
+            return None
+
+        bucket = (
+            int(tick.timestamp)
+            // period
+        ) * period
+
+        return PocketOptionCandle(
+            timestamp=bucket,
+            open=tick.price,
+            high=tick.price,
+            low=tick.price,
+            close=tick.price,
+            volume=0.0,
+        )
+
+    def _aggregate_ticks(
+        self,
+        ticks: list[PocketOptionTick],
+        period: int,
+    ) -> list[PocketOptionCandle]:
+        if period <= 0:
+            return []
+
+        grouped: dict[
+            int,
+            list[PocketOptionTick],
+        ] = defaultdict(list)
+
+        for tick in sorted(
+            ticks,
+            key=lambda item: item.timestamp,
+        ):
+            bucket = (
+                int(tick.timestamp)
+                // period
+            ) * period
+
+            grouped[bucket].append(
+                tick
+            )
+
+        candles: list[
+            PocketOptionCandle
+        ] = []
+
+        for timestamp in sorted(
+            grouped
+        ):
+            group = grouped[timestamp]
+
+            if not group:
+                continue
+
+            prices = [
+                tick.price
+                for tick in group
+            ]
+
+            candles.append(
+                PocketOptionCandle(
+                    timestamp=timestamp,
+                    open=prices[0],
+                    high=max(prices),
+                    low=min(prices),
+                    close=prices[-1],
+                    volume=0.0,
+                )
+            )
+
+        return candles
+
+    # ==========================================================================
+    # HISTORY ACCESS
+    # ==========================================================================
+
+    def get_cached_candles(
         self,
         symbol: str,
-        timestamp: float,
-        price: float,
-    ) -> None:
-        """
-        Сохраняет tick и передаёт его callback.
-
-        Никакой торговой логики здесь нет.
-        """
-
-        symbol = str(
+        timeframe_seconds: int = 60,
+        limit: int = 500,
+    ) -> list[PocketOptionCandle]:
+        symbol = self.normalize_symbol(
             symbol
-        ).strip()
+        )
 
-        if not symbol:
-            return
-
-        try:
-
-            timestamp = float(
-                timestamp
-            )
-
-            price = float(
-                price
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-            return
-
-        if timestamp <= 0:
-            return
-
-        if price <= 0:
-            return
-
-        tick = (
+        key = (
             symbol,
-            timestamp,
-            price,
+            int(timeframe_seconds),
         )
 
-        self._ticks.append(
-            tick
+        candles = list(
+            self._history.get(
+                key,
+                (),
+            )
         )
 
-        self._last_tick[
-            symbol
-        ] = (
-            timestamp,
-            price,
-        )
-
-        self._last_tick_time = time.time()
-
-        print(
-            f"📈 TICK "
-            f"{symbol} "
-            f"{timestamp:.3f} "
-            f"{price}"
-        )
-
-        if self.tick_callback is None:
-            return
-
-        try:
-
-            result = self.tick_callback(
-                symbol,
-                timestamp,
-                price,
+        if not candles:
+            ticks = list(
+                self._ticks.get(
+                    symbol,
+                    (),
+                )
             )
 
-            if result is not None:
-                await result
+            if ticks:
+                candles = self._aggregate_ticks(
+                    ticks,
+                    int(timeframe_seconds),
+                )
 
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as exc:
-
-            print(
-                "x Tick callback error: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-    # =========================================================================
-    # RESET BINARY
-    # =========================================================================
-
-    def _reset_binary_state(
-        self,
-    ) -> None:
-
-        self._binary_event_name = None
-        self._binary_event_payload = None
-        self._binary_expected = 0
-        self._binary_received = 0
-        self._binary_attachments = {}
-
-    # =========================================================================
-    # GET TICKS
-    # =========================================================================
+        return candles[-limit:]
 
     def get_ticks(
         self,
-        symbol: str | None = None,
-    ) -> list[
-        tuple[str, float, float]
-    ]:
-        """Возвращает копию tick buffer."""
-
-        ticks = list(
-            self._ticks
+        symbol: str,
+        limit: int = 100,
+    ) -> list[PocketOptionTick]:
+        symbol = self.normalize_symbol(
+            symbol
         )
 
-        if symbol is None:
-            return ticks
+        ticks = list(
+            self._ticks.get(
+                symbol,
+                (),
+            )
+        )
 
-        return [
-            tick
-            for tick in ticks
-            if tick[0] == symbol
-        ]
-
-    # =========================================================================
-    # GET LAST TICK
-    # =========================================================================
+        return ticks[-limit:]
 
     def get_last_tick(
         self,
         symbol: str,
-    ) -> tuple[float, float] | None:
-        """Возвращает последний tick."""
-
-        return self._last_tick.get(
+    ) -> PocketOptionTick | None:
+        symbol = self.normalize_symbol(
             symbol
         )
 
-    # =========================================================================
-    # GET SUBSCRIPTIONS
-    # =========================================================================
-
-    def get_subscriptions(self) -> list[str]:
-        """Возвращает список текущих локальных подписок."""
-
-        return sorted(
-            self._subscriptions
+        ticks = self._ticks.get(
+            symbol
         )
 
-    # =========================================================================
-    # STATUS
-    # =========================================================================
+        if not ticks:
+            return None
 
-    def status(self) -> dict[str, Any]:
-        """
-        Возвращает безопасный статус.
+        return ticks[-1]
 
-        SSID никогда не возвращается.
-        """
+    # ==========================================================================
+    # WAITERS
+    # ==========================================================================
 
-        return {
-            "connected": self.connected,
-            "namespace_connected": (
-                self.namespace_connected
-            ),
-            "authenticated": self.authenticated,
-            "running": self._running,
-            "ticks_buffered": len(
-                self._ticks
-            ),
-            "last_message_time": (
-                self._last_message_time
-            ),
-            "last_tick_time": (
-                self._last_tick_time
-            ),
-            "authenticated_at": (
-                self._authenticated_at
-            ),
-            "uid": self.uid,
-            "subscriptions": (
-                self.get_subscriptions()
-            ),
-            "analytics_only": True,
-            "trade_execution": False,
-        }
+    def _resolve_history_waiters(
+        self,
+        key: tuple[str, int],
+        candles: list[PocketOptionCandle],
+    ) -> None:
+        waiters = self._history_waiters.get(
+            key,
+            [],
+        )
 
-    # =========================================================================
-    # SAFE PREVIEW
-    # =========================================================================
+        if not waiters:
+            return
 
-    @staticmethod
-    def _safe_preview(
-        value: Any,
-        limit: int = 1000,
-    ) -> str:
-        """Безопасный preview для диагностических логов."""
+        self._history_waiters[key] = []
+
+        for future in waiters:
+            if not future.done():
+                future.set_result(
+                    candles
+                )
+
+    async def _wait_until_authenticated(
+        self,
+        timeout: float = 15.0,
+    ) -> None:
+        if self.is_authenticated:
+            return
+
+        if not self.is_connected:
+            await self.connect()
 
         try:
+            await asyncio.wait_for(
+                self._authenticated.wait(),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise PocketOptionWebSocketError(
+                "Pocket Option authentication timeout."
+            ) from exc
 
-            text = json.dumps(
-                value,
-                ensure_ascii=False,
-                default=str,
+    # ==========================================================================
+    # RECONNECT LOOP
+    # ==========================================================================
+
+    async def run_forever(self) -> None:
+        """
+        Основной lifecycle клиента.
+
+        При разрыве соединения:
+            disconnect
+                ↓
+            backoff
+                ↓
+            reconnect
+                ↓
+            auth
+                ↓
+            restore subscriptions
+        """
+        reconnect_delay = self.RECONNECT_MIN
+
+        while not self._stop_requested:
+            try:
+                await self.connect()
+
+                reconnect_delay = self.RECONNECT_MIN
+
+                await self.run()
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as exc:
+                self._last_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+            finally:
+                self._connected.clear()
+                self._authenticated.clear()
+
+                if (
+                    self.ws is not None
+                    and self.ws.closed
+                ):
+                    self.ws = None
+
+            if self._stop_requested:
+                break
+
+            await asyncio.sleep(
+                reconnect_delay
             )
 
+            reconnect_delay = min(
+                reconnect_delay * 2.0,
+                self.RECONNECT_MAX,
+            )
+
+            if self._subscriptions:
+                # Подписки восстанавливаются после
+                # успешной следующей авторизации.
+                continue
+
+    async def start(self) -> None:
+        """
+        Запустить background lifecycle.
+        """
+        if (
+            self._runner_task is not None
+            and not self._runner_task.done()
+        ):
+            return
+
+        self._stop_requested = False
+
+        self._runner_task = (
+            asyncio.create_task(
+                self.run_forever()
+            )
+        )
+
+    async def stop(self) -> None:
+        """
+        Корректно остановить WebSocket.
+        """
+        self._stop_requested = True
+
+        if self._runner_task is not None:
+            if (
+                not self._runner_task.done()
+                and self._runner_task
+                is not asyncio.current_task()
+            ):
+                self._runner_task.cancel()
+
+                try:
+                    await self._runner_task
+                except asyncio.CancelledError:
+                    pass
+
+            self._runner_task = None
+
+        await self._close_socket()
+
+        if (
+            self.session is not None
+            and not self.session.closed
+        ):
+            await self.session.close()
+
+        self.session = None
+
+    async def _close_socket(self) -> None:
+        if self.ws is None:
+            return
+
+        ws = self.ws
+        self.ws = None
+
+        try:
+            await ws.close()
         except Exception:
+            pass
 
-            text = repr(value)
+        self._connected.clear()
+        self._authenticated.clear()
 
-        return text[:limit]
+    # ==========================================================================
+    # SYMBOL / TIMEFRAME HELPERS
+    # ==========================================================================
+
+    @staticmethod
+    def normalize_symbol(
+        symbol: str,
+    ) -> str:
+        """
+        Преобразует UI-имя инструмента в технический
+        Pocket Option identifier.
+
+        Примеры:
+
+            EUR/USD       -> EURUSD
+            EUR/USD OTC   -> EURUSD_otc
+            EURUSD_otc    -> EURUSD_otc
+            CHF NOK_otc   -> CHFNOK_otc
+        """
+        value = str(symbol).strip()
+
+        if not value:
+            raise ValueError(
+                "Symbol is required."
+            )
+
+        value = value.replace(
+            " ",
+            "",
+        )
+
+        otc = False
+
+        upper = value.upper()
+
+        if upper.endswith("_OTC"):
+            otc = True
+            value = value[:-4]
+
+        elif upper.endswith("OTC"):
+            otc = True
+            value = value[:-3]
+
+        value = value.replace(
+            "/",
+            "",
+        )
+
+        value = value.upper()
+
+        if otc:
+            return f"{value}_otc"
+
+        return value
+
+    @staticmethod
+    def timeframe_to_seconds(
+        timeframe: str | int,
+    ) -> int:
+        if isinstance(
+            timeframe,
+            int,
+        ):
+            if timeframe <= 0:
+                raise ValueError(
+                    "Invalid timeframe."
+                )
+
+            return timeframe
+
+        value = str(
+            timeframe
+        ).strip().lower()
+
+        mapping = {
+            "1m": 60,
+            "5m": 300,
+            "15m": 900,
+            "30m": 1800,
+            "1h": 3600,
+            "4h": 14400,
+            "1d": 86400,
+        }
+
+        if value not in mapping:
+            raise ValueError(
+                f"Unsupported timeframe: {timeframe}"
+            )
+
+        return mapping[value]
+
+    # ==========================================================================
+    # TIME
+    # ==========================================================================
+
+    def server_timestamp(self) -> float:
+        return time.time() + self._server_time_offset
+
+    # ==========================================================================
+    # VALIDATION / DEDUPLICATION
+    # ==========================================================================
+
+    @staticmethod
+    def _deduplicate_candles(
+        candles: list[PocketOptionCandle],
+    ) -> list[PocketOptionCandle]:
+        unique: dict[
+            int,
+            PocketOptionCandle,
+        ] = {}
+
+        for candle in candles:
+            unique[
+                candle.timestamp
+            ] = candle
+
+        return [
+            unique[timestamp]
+            for timestamp in sorted(unique)
+        ]
+
+    def _infer_period(
+        self,
+        symbol: str,
+    ) -> int:
+        periods = self._subscriptions.get(
+            symbol
+        )
+
+        if periods:
+            return min(periods)
+
+        return 60
+
+    # ==========================================================================
+    # STATUS
+    # ==========================================================================
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "connected": self.is_connected,
+            "authenticated": self.is_authenticated,
+            "analytics_only": True,
+            "trade_execution": False,
+            "known_symbols": sorted(
+                self._known_symbols
+            ),
+            "subscriptions": {
+                symbol: sorted(periods)
+                for symbol, periods
+                in self._subscriptions.items()
+            },
+            "last_message_at": (
+                self._last_message_at
+            ),
+            "last_tick_at": (
+                self._last_tick_at
+            ),
+            "last_error": self._last_error,
+        }
 
 
-# =============================================================================
-# DIAGNOSTIC MAIN
-# =============================================================================
+# ==============================================================================
+# DIAGNOSTIC ENTRY POINT
+# ==============================================================================
 
 async def main() -> None:
     """
-    Диагностический запуск.
+    Локальная диагностика WebSocket.
 
-    Только подключение и получение рыночных данных.
-
-    Автоматическая торговля отсутствует.
+    Никаких торговых операций.
     """
-
-    print("=" * 64)
-    print(
-        "PocketTradeSignalsBot"
-    )
-    print(
-        "Pocket Option WebSocket diagnostic client"
-    )
-    print("=" * 64)
-
-    print(
-        "WS URL:",
-        os.getenv(
-            "POCKET_OPTION_WS_URL"
-        )
-        or PocketOptionWebSocketClient.DEFAULT_WS_URL,
-    )
-
-    print(
-        "SSID:",
-        "SET"
-        if os.getenv(
-            "POCKET_OPTION_SSID"
-        )
-        else "NOT SET",
-    )
-
-    print(
-        "UID:",
-        os.getenv(
-            "POCKET_OPTION_UID"
-        )
-        or "NOT SET",
-    )
-
-    print(
-        "LANG:",
-        os.getenv(
-            "POCKET_OPTION_LANG",
-            "ru",
-        ),
-    )
-
-    print(
-        "CURRENT URL:",
-        os.getenv(
-            "POCKET_OPTION_CURRENT_URL",
-            "cabinet/quick-high-low/USD",
-        ),
-    )
-
-    print(
-        "IS CHART:",
-        os.getenv(
-            "POCKET_OPTION_IS_CHART",
-            "1",
-        ),
-    )
-
-    print(
-        "TRADE EXECUTION:",
-        "DISABLED",
-    )
-
-    print("=" * 64)
-
-    async def on_tick(
-        symbol: str,
-        timestamp: float,
-        price: float,
-    ) -> None:
-
-        print(
-            "CALLBACK:",
-            symbol,
-            timestamp,
-            price,
-        )
-
-    client = PocketOptionWebSocketClient(
-        tick_callback=on_tick,
-    )
+    client = PocketOptionWebSocketClient()
 
     try:
+        await client.start()
 
-        await client.run_forever()
-
-    except KeyboardInterrupt:
-
-        print(
-            "Stopped by user"
+        await asyncio.wait_for(
+            client._authenticated.wait(),
+            timeout=20.0,
         )
 
-    except PocketOptionWebSocketError as exc:
-
         print(
-            "PocketOptionWebSocketError:",
-            exc,
+            "Pocket Option WebSocket: AUTHENTICATED"
         )
 
-    except asyncio.CancelledError:
-
-        print(
-            "Cancelled"
+        await client.subscribe(
+            "EURUSD_otc",
+            60,
         )
 
-        raise
-
-    except Exception as exc:
+        candles = await client.request_history(
+            "EURUSD_otc",
+            60,
+            offset=500,
+            timeout=20.0,
+        )
 
         print(
-            "Unexpected error: "
-            f"{type(exc).__name__}: {exc}"
+            f"Historical candles: {len(candles)}"
         )
+
+        while True:
+            await asyncio.sleep(5)
+
+            ticks = client.get_ticks(
+                "EURUSD_otc",
+                limit=5,
+            )
+
+            print(
+                "Ticks:",
+                [
+                    (
+                        tick.timestamp,
+                        tick.price,
+                    )
+                    for tick in ticks
+                ],
+            )
+
+            print(
+                "Status:",
+                client.status(),
+            )
 
     finally:
-
-        await client.close()
-
-        print(
-            "Final status:",
-            client.status(),
-        )
+        await client.stop()
 
 
 if __name__ == "__main__":
