@@ -1,28 +1,190 @@
-# PocketTradeSignalsBot v8
+PocketTradeSignalsBot v8
 
-Аналитический Telegram-бот. Автоматическое открытие сделок отключено.
+Аналитический Telegram-бот для получения рыночных данных и формирования торговых сигналов.
 
-## Источники котировок
-- `twelvedata` — Twelve Data.
-- `pocket_otc` — Pocket Option OTC через настроенный bridge/adapter.
+Автоматическое открытие сделок отключено и в проекте не используется.
 
-Переключение выполняется в Telegram в разделе `Настройки`.
+Архитектура
 
-Важно: Pocket Option не предоставляет стабильный официальный публичный API для OTC-истории в виде стандартного REST endpoint. Поэтому проект не содержит выдуманного URL. OTC-провайдер работает fail-closed и требует проверенный bridge, задаваемый через `POCKET_OPTION_OTC_API_URL`. Существующие сторонние WebSocket-клиенты требуют сессионную авторизацию и могут ломаться при изменениях платформы.
+Единственный источник рыночных данных — Pocket Option через WebSocket.
 
-## Переменные окружения
-Скопируйте `.env.example` в настройки Railway Variables и задайте:
-- `TELEGRAM_BOT_TOKEN`
-- `TWELVE_DATA_API_KEY`
-- `MARKET_DATA_SOURCE=twelvedata` или `pocket_otc`
-- для OTC: `POCKET_OPTION_OTC_API_URL` и при необходимости `POCKET_OPTION_OTC_API_KEY`
+Pocket Option WebSocket
+        ↓
+History + Realtime Ticks
+        ↓
+Candle Builder
+        ↓
+IndicatorEngine
+        ↓
+Price Action
+        ↓
+Market Regime
+        ↓
+Machine Learning
+        ↓
+Consensus
+        ↓
+STRONG / NORMAL / NO SIGNAL
+        ↓
+Telegram
+        ↓
+Решение пользователя
 
-## Запуск
-```bash
+Источник данных
+
+Проект использует только данные, полученные непосредственно от Pocket Option:
+
+* список доступных инструментов;
+* исторические данные;
+* realtime ticks;
+* данные для построения свечей.
+
+Twelve Data не используется.
+
+Сторонние REST bridge/adapter для получения рыночных данных не используются.
+
+Pocket Option WebSocket
+
+Подключение выполняется через Socket.IO / Engine.IO WebSocket.
+
+Основные параметры задаются переменными окружения:
+
+POCKET_OPTION_WS_URL
+POCKET_OPTION_SSID
+POCKET_OPTION_UID
+
+Дополнительно могут использоваться:
+
+POCKET_OPTION_LANG
+POCKET_OPTION_CURRENT_URL
+POCKET_OPTION_IS_CHART
+
+POCKET_OPTION_SSID содержит сессионный токен Pocket Option и не должен публиковаться.
+
+Telegram
+
+Для работы Telegram-бота требуется:
+
+TELEGRAM_BOT_TOKEN
+
+Бот предоставляет:
+
+* получение сигнала;
+* анализ рынка;
+* анализ индикаторов;
+* статус системы;
+* настройки;
+* информацию о боте.
+
+Аналитика
+
+Рыночные данные проходят через последовательность:
+
+Ticks
+  ↓
+Candles
+  ↓
+Indicators
+  ↓
+Price Action
+  ↓
+Market Regime
+  ↓
+ML
+  ↓
+Consensus
+  ↓
+Signal
+
+Результатом анализа может быть:
+
+* CALL;
+* PUT;
+* FLAT;
+* STRONG;
+* NORMAL;
+* NO SIGNAL.
+
+Конкретный набор итоговых состояний определяется текущей реализацией SignalEngine.
+
+Безопасность
+
+Секретные данные не должны храниться в исходном коде.
+
+В частности, нельзя публиковать:
+
+* TELEGRAM_BOT_TOKEN;
+* POCKET_OPTION_SSID;
+* POCKET_OPTION_UID;
+* другие секретные ключи и токены.
+
+Все секреты должны передаваться через переменные окружения.
+
+Если Telegram-токен или сессионные данные Pocket Option были опубликованы, их необходимо заменить/отозвать соответствующим сервисом.
+
+Автоматическая торговля
+
+Проект является аналитическим.
+
+В проекте отсутствуют:
+
+* автоматическое открытие сделок;
+* автоматическое закрытие сделок;
+* buy;
+* sell;
+* place_order;
+* торговый executor;
+* автоматическая отправка торговых приказов.
+
+Сигнал передаётся пользователю в Telegram. Решение о совершении сделки пользователь принимает самостоятельно.
+
+Установка
+
+Установить зависимости:
+
 pip install -r requirements.txt
-pytest -q
-python bot.py
-```
 
-## Безопасность
-Telegram-токен не хранится в исходном коде. Если старый токен когда-либо был опубликован в GitHub/Railway logs/чате, его необходимо отозвать через BotFather и создать новый.
+Запустить тесты:
+
+pytest -q
+
+Запустить бота:
+
+python bot.py
+
+Требования
+
+Основные зависимости:
+
+* Python 3;
+* aiogram;
+* aiohttp;
+* numpy;
+* pandas.
+
+WebSocket-соединение с Pocket Option реализовано непосредственно через aiohttp.
+
+Структура проекта
+
+Основные компоненты:
+
+core/
+indicators/
+matching/
+monitoring/
+pocket_option/
+signals/
+storage/
+tests/
+data/
+services/
+bot.py
+requirements.txt
+
+Рыночный поток проекта построен вокруг Pocket Option WebSocket.
+
+Важно
+
+Проект предназначен для анализа рынка и формирования сигналов.
+
+Он не выполняет автоматическую торговлю.
