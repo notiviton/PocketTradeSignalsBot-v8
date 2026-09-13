@@ -1,57 +1,41 @@
 import asyncio
 import os
-
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-
 from data.assets import POCKET_OTC_ASSETS
 from indicators.indicator_engine import IndicatorEngine
 from services.forex_service import ForexService
 from signals.signal_engine import SignalEngine
-
-
 # ============================================================
 # TELEGRAM BOT TOKEN
 # ============================================================
-
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
 if not TOKEN:
     raise RuntimeError(
         "TELEGRAM_BOT_TOKEN is not configured"
     )
-
-
 # ============================================================
 # BOT
 # ============================================================
-
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-
-
 # ============================================================
 # HOSTLESS HEALTH SERVER
 # ============================================================
-
 HOST = os.getenv(
     "HOST",
     "0.0.0.0",
 )
-
 PORT = int(
     os.getenv(
         "PORT",
         "8000",
     )
 )
-
 health_runner: web.AppRunner | None = None
-
-
 async def health_handler(
     request: web.Request,
 ) -> web.Response:
@@ -63,78 +47,62 @@ async def health_handler(
             "automatic_trading": False,
         }
     )
-
-
 async def start_health_server():
     global health_runner
-
     app = web.Application()
-
     app.router.add_get(
         "/health",
         health_handler,
     )
-
     health_runner = web.AppRunner(app)
-
     await health_runner.setup()
-
     site = web.TCPSite(
         health_runner,
         HOST,
         PORT,
     )
-
     await site.start()
-
     print(
         f"HTTP health server started: "
         f"http://{HOST}:{PORT}/health"
     )
-
-
 async def stop_health_server():
     global health_runner
-
     if health_runner is not None:
         await health_runner.cleanup()
-
         health_runner = None
-
         print(
             "HTTP health server stopped"
         )
-
-
 # ============================================================
 # SERVICES
 # ============================================================
-
 forex_service = ForexService()
 signal_engine = SignalEngine()
-
-
 # ============================================================
 # USER SETTINGS
 # ============================================================
-
 user_settings: dict[int, dict[str, str]] = {}
-
+# Состояние работы бота для каждого пользователя.
+#
+# True  = пользователь активен
+# False = пользователь нажал Стоп
+#
+# ВАЖНО:
+# Это НЕ останавливает Telegram polling,
+# Pocket Option WebSocket или Hostless.
+user_active: dict[int, bool] = {}
 DEFAULT_SYMBOL = os.getenv(
     "POCKET_OPTION_DEFAULT_SYMBOL",
     "EUR/USD OTC",
 )
-
 DEFAULT_TIMEFRAME = os.getenv(
     "POCKET_OPTION_DEFAULT_TIMEFRAME",
     "1m",
 )
-
-
 # ============================================================
 # TIMEFRAMES
 # ============================================================
-
 TIMEFRAMES = [
     "1m",
     "5m",
@@ -144,114 +112,90 @@ TIMEFRAMES = [
     "4h",
     "1D",
 ]
-
-
 # ============================================================
 # USER SETTINGS
 # ============================================================
-
 def get_user_settings(
     user_id: int,
 ) -> dict[str, str]:
-
     if user_id not in user_settings:
         user_settings[user_id] = {
             "symbol": DEFAULT_SYMBOL,
             "timeframe": DEFAULT_TIMEFRAME,
         }
-
     return user_settings[user_id]
-
-
 # ============================================================
-# SYMBOLS
+# USER ACTIVE STATE
 # ============================================================
-
-def get_pocket_symbols() -> list[str]:
-    """
-    Получить список инструментов, доступных в UI.
-
-    Техническое преобразование в Pocket Option identifier
-    выполняется внутри PocketOptionWebSocketClient.
-    """
-
-    symbols: list[str] = []
-
-    for _, asset_list in POCKET_OTC_ASSETS.items():
-
-        for symbol in asset_list:
-
-            if symbol not in symbols:
-                symbols.append(symbol)
-
-    return symbols
-
-
+def is_user_active(
+    user_id: int,
+) -> bool:
+    return user_active.get(
+        user_id,
+        False,
+    )
+def activate_user(
+    user_id: int,
+):
+    user_active[user_id] = True
+def deactivate_user(
+    user_id: int,
+):
+    user_active[user_id] = False
 # ============================================================
-# SYMBOL DISPLAY
+# START / STOP MENU
 # ============================================================
-
-def display_symbol(
-    symbol: str,
-) -> str:
-    return symbol
-
-
+def control_menu():
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🟢 Старт",
+        callback_data="user_start",
+    )
+    builder.button(
+        text="⏹️ Стоп",
+        callback_data="user_stop",
+    )
+    builder.adjust(2)
+    return builder.as_markup()
 # ============================================================
 # MAIN MENU
 # ============================================================
-
 def main_menu():
-
     builder = InlineKeyboardBuilder()
-
     builder.button(
         text="📈 Получить сигнал",
         callback_data="signal",
     )
-
     builder.button(
         text="📊 Анализ рынка",
         callback_data="analysis",
     )
-
     builder.button(
         text="📊 Индикаторы",
         callback_data="indicators",
     )
-
     builder.button(
         text="📋 Статус системы",
         callback_data="status",
     )
-
     builder.button(
         text="⚙️ Настройки",
         callback_data="settings",
     )
-
     builder.button(
         text="ℹ️ О боте",
         callback_data="about",
     )
-
     builder.adjust(1)
-
     return builder.as_markup()
-
-
 # ============================================================
 # SETTINGS MENU
 # ============================================================
-
 def settings_menu(
     user_id: int,
 ):
-
     settings = get_user_settings(user_id)
-
     builder = InlineKeyboardBuilder()
-
     builder.button(
         text=(
             "💱 Инструмент: "
@@ -259,7 +203,6 @@ def settings_menu(
         ),
         callback_data="select_symbol",
     )
-
     builder.button(
         text=(
             "⏱ Таймфрейм: "
@@ -267,79 +210,75 @@ def settings_menu(
         ),
         callback_data="select_timeframe",
     )
-
     builder.button(
         text="⬅️ Главное меню",
         callback_data="main_menu",
     )
-
     builder.adjust(1)
-
     return builder.as_markup()
-
-
 # ============================================================
 # SYMBOL MENU
 # ============================================================
-
 def symbol_menu():
-
     builder = InlineKeyboardBuilder()
-
     symbols = get_pocket_symbols()
-
     for symbol in symbols:
-
         builder.button(
             text=f"🟣 {display_symbol(symbol)}",
             callback_data=f"symbol:{symbol}",
         )
-
     builder.button(
         text="⬅️ Назад",
         callback_data="settings",
     )
-
     builder.adjust(1)
-
     return builder.as_markup()
-
-
 # ============================================================
 # TIMEFRAME MENU
 # ============================================================
-
 def timeframe_menu():
-
     builder = InlineKeyboardBuilder()
-
     for timeframe in TIMEFRAMES:
-
         builder.button(
             text=f"⏱ {timeframe}",
             callback_data=f"timeframe:{timeframe}",
         )
-
     builder.button(
         text="⬅️ Назад",
         callback_data="settings",
     )
-
     builder.adjust(1)
-
     return builder.as_markup()
-
-
+# ============================================================
+# SYMBOLS
+# ============================================================
+def get_pocket_symbols() -> list[str]:
+    """
+    Получить список инструментов, доступных в UI.
+    Техническое преобразование в Pocket Option identifier
+    выполняется внутри PocketOptionWebSocketClient.
+    """
+    symbols: list[str] = []
+    for _, asset_list in POCKET_OTC_ASSETS.items():
+        for symbol in asset_list:
+            if symbol not in symbols:
+                symbols.append(symbol)
+    return symbols
+# ============================================================
+# SYMBOL DISPLAY
+# ============================================================
+def display_symbol(
+    symbol: str,
+) -> str:
+    return symbol
 # ============================================================
 # FORMAT SIGNAL
 # ============================================================
-
 def format_signal(
     result,
     symbol: str,
     timeframe: str,
 ):
-
     signal_name = {
         "CALL": "🟢 CALL",
         "PUT": "🔴 PUT",
@@ -348,7 +287,6 @@ def format_signal(
         result.signal,
         result.signal,
     )
-
     text = (
         "📈 ТОРГОВЫЙ СИГНАЛ\n\n"
         f"💱 Инструмент: {symbol}\n"
@@ -361,49 +299,37 @@ def format_signal(
         f"{result.bearish_score}\n\n"
         "Причины:\n"
     )
-
     for reason in result.reasons:
         text += f"• {reason}\n"
-
     if result.warnings:
-
         text += "\n⚠️ Предупреждения:\n"
-
         for warning in result.warnings:
             text += f"• {warning}\n"
-
     text += (
         "\n⚠️ Только аналитика.\n"
         "Автоматическое открытие сделок "
         "отключено."
     )
-
     return text
-
-
 # ============================================================
 # FORMAT INDICATORS
 # ============================================================
-
 def format_indicators(
     indicators,
     symbol: str,
     timeframe: str,
 ):
-
     return (
         "📊 ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ\n\n"
         f"💱 Инструмент: {symbol}\n"
         f"⏱ Таймфрейм: {timeframe}\n"
         f"💰 Цена Close: "
         f"{indicators['close']:.5f}\n\n"
-
         "━━━━━━━━━━━━━━━━━━\n"
         "📈 RSI\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"RSI(14): "
         f"{indicators['rsi']:.2f}\n\n"
-
         "━━━━━━━━━━━━━━━━━━\n"
         "📉 MACD\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -413,7 +339,6 @@ def format_indicators(
         f"{indicators['macd_signal']:.6f}\n"
         f"Histogram: "
         f"{indicators['macd_histogram']:.6f}\n\n"
-
         "━━━━━━━━━━━━━━━━━━\n"
         "📊 STOCHASTIC\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -421,7 +346,6 @@ def format_indicators(
         f"{indicators['stochastic_k']:.2f}\n"
         f"%D: "
         f"{indicators['stochastic_d']:.2f}\n\n"
-
         "━━━━━━━━━━━━━━━━━━\n"
         "📐 BOLLINGER BANDS\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -432,23 +356,18 @@ def format_indicators(
         f"Lower: "
         f"{indicators['bollinger_lower']:.5f}\n"
     )
-
-
 # ============================================================
-# START
+# START COMMAND
 # ============================================================
-
 @dp.message(CommandStart())
 async def start(
     message: Message,
 ):
-
-    get_user_settings(
-        message.from_user.id
-    )
-
+    user_id = message.from_user.id
+    get_user_settings(user_id)
+    activate_user(user_id)
     await message.answer(
-        "✅ PocketTradeSignalsBot запущен.\n\n"
+        "🟢 PocketTradeSignalsBot запущен.\n\n"
         "📡 Источник данных:\n"
         "Pocket Option WebSocket\n\n"
         "Это аналитический бот.\n"
@@ -457,87 +376,137 @@ async def start(
         "Выберите действие:",
         reply_markup=main_menu(),
     )
-
-
+    await message.answer(
+        "Управление:",
+        reply_markup=control_menu(),
+    )
+# ============================================================
+# BUTTON: START
+# ============================================================
+@dp.callback_query(
+    F.data == "user_start"
+)
+async def user_start_callback(
+    callback: CallbackQuery,
+):
+    user_id = callback.from_user.id
+    activate_user(user_id)
+    get_user_settings(user_id)
+    await callback.answer(
+        "🟢 Бот включён."
+    )
+    await callback.message.answer(
+        "🟢 Работа бота включена.\n\n"
+        "Теперь доступны сигналы, анализ, "
+        "индикаторы и настройки.",
+        reply_markup=main_menu(),
+    )
+# ============================================================
+# BUTTON: STOP
+# ============================================================
+@dp.callback_query(
+    F.data == "user_stop"
+)
+async def user_stop_callback(
+    callback: CallbackQuery,
+):
+    user_id = callback.from_user.id
+    deactivate_user(user_id)
+    await callback.answer(
+        "⏹️ Бот остановлен."
+    )
+    await callback.message.answer(
+        "⏹️ Работа бота остановлена для этого пользователя.\n\n"
+        "Telegram polling продолжает работать.\n"
+        "Pocket Option WebSocket продолжает работать.\n"
+        "Hostless продолжает работать.\n\n"
+        "Для повторного запуска нажмите "
+        "«🟢 Старт».",
+        reply_markup=control_menu(),
+    )
 # ============================================================
 # TEST MARKET DATA
 # ============================================================
-
 @dp.message(Command("test_forex"))
 async def test_forex(
     message: Message,
 ):
-
-    settings = get_user_settings(
-        message.from_user.id
-    )
-
+    user_id = message.from_user.id
+    if not is_user_active(user_id):
+        await message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
+    settings = get_user_settings(user_id)
     await message.answer(
         "⏳ Проверяю подключение к "
         "Pocket Option WebSocket..."
     )
-
     try:
-
         result = await forex_service.get_last_prices(
             symbol=settings["symbol"],
             timeframe=settings["timeframe"],
         )
-
         await message.answer(result)
-
     except Exception as exc:
-
         await message.answer(
             "❌ Ошибка проверки рыночных данных.\n\n"
             f"Причина: {exc}"
         )
-
-
 # ============================================================
 # COMMAND: SIGNAL
 # ============================================================
-
 @dp.message(Command("signal"))
 async def signal_command(
     message: Message,
 ):
-
+    if not is_user_active(
+        message.from_user.id
+    ):
+        await message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     await message.answer(
         "📈 Чтобы получить сигнал, "
         "используйте кнопку "
         "«📈 Получить сигнал» "
         "в главном меню."
     )
-
-
 # ============================================================
 # COMMAND: ANALYSIS
 # ============================================================
-
 @dp.message(Command("analysis"))
 async def analysis_command(
     message: Message,
 ):
-
+    if not is_user_active(
+        message.from_user.id
+    ):
+        await message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     status = forex_service.status()
-
     connected = status.get(
         "connected",
         False,
     )
-
     authenticated = status.get(
         "authenticated",
         False,
     )
-
     market_status = (
         "🟢 ONLINE"
         if connected and authenticated
         else "🟡 CONNECTING / OFFLINE"
     )
-
     await message.answer(
         "📊 Анализ рынка\n\n"
         f"📡 Market Data Layer: "
@@ -547,83 +516,82 @@ async def analysis_command(
         "Источник: Pocket Option WebSocket\n"
         "Автоматическая торговля отключена."
     )
-
-
 # ============================================================
 # COMMAND: INDICATORS
 # ============================================================
-
 @dp.message(Command("indicators"))
 async def indicators_command(
     message: Message,
 ):
-
+    if not is_user_active(
+        message.from_user.id
+    ):
+        await message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     await message.answer(
         "📊 Чтобы посмотреть технические "
         "индикаторы, используйте кнопку "
         "«📊 Индикаторы» "
         "в главном меню."
     )
-
-
 # ============================================================
 # COMMAND: STATUS
 # ============================================================
-
 @dp.message(Command("status"))
 async def status_command(
     message: Message,
 ):
-
+    user_id = message.from_user.id
+    if not is_user_active(user_id):
+        await message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     status = forex_service.status()
-
     connected = status.get(
         "connected",
         False,
     )
-
     authenticated = status.get(
         "authenticated",
         False,
     )
-
     started = status.get(
         "started",
         False,
     )
-
     market_status = (
         "🟢 ONLINE"
         if connected and authenticated
         else "🔴 OFFLINE"
     )
-
     auth_status = (
         "🟢 AUTHENTICATED"
         if authenticated
         else "🔴 NOT AUTHENTICATED"
     )
-
     runtime_status = (
         "🟢 RUNNING"
         if started
         else "🔴 STOPPED"
     )
-
     subscriptions = status.get(
         "subscriptions",
         {},
     )
-
     known_symbols = status.get(
         "known_symbols",
         [],
     )
-
     last_error = status.get(
         "last_error"
     )
-
     text = (
         "📋 СТАТУС СИСТЕМЫ\n\n"
         "🤖 Telegram Bot: 🟢 ONLINE\n\n"
@@ -638,49 +606,55 @@ async def status_command(
         f"💱 Известных инструментов: "
         f"{len(known_symbols)}\n"
     )
-
     if last_error:
-
         text += (
             "\n⚠️ Последняя ошибка:\n"
             f"{last_error}\n"
         )
-
     text += (
         "\n⚠️ Аналитический режим.\n"
         "Автоматическое открытие сделок "
         "отключено."
     )
-
     await message.answer(text)
-
-
 # ============================================================
 # COMMAND: SETTINGS
 # ============================================================
-
 @dp.message(Command("settings"))
 async def settings_command(
     message: Message,
 ):
-
+    if not is_user_active(
+        message.from_user.id
+    ):
+        await message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     await message.answer(
         "⚙️ Чтобы изменить настройки, "
         "используйте кнопку "
         "«⚙️ Настройки» "
         "в главном меню."
     )
-
-
 # ============================================================
 # COMMAND: ABOUT
 # ============================================================
-
 @dp.message(Command("about"))
 async def about_command(
     message: Message,
 ):
-
+    if not is_user_active(
+        message.from_user.id
+    ):
+        await message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     await message.answer(
         "ℹ️ PocketTradeSignalsBot\n\n"
         "Аналитический Telegram-бот "
@@ -697,79 +671,59 @@ async def about_command(
         "⚠️ Бот не открывает сделки автоматически.\n"
         "Все торговые решения принимает пользователь."
     )
-
-
 # ============================================================
 # SIGNAL CALLBACK
 # ============================================================
-
 @dp.callback_query(F.data == "signal")
 async def signal_callback(
     callback: CallbackQuery,
 ):
-
-    # --------------------------------------------------------
-    # ВАЖНО:
-    # Подтверждаем callback СРАЗУ.
-    #
-    # Получение 500 свечей через Pocket Option WebSocket,
-    # расчёт индикаторов и формирование сигнала могут
-    # занимать больше времени, чем разрешено Telegram
-    # для callback_query.
-    # --------------------------------------------------------
     await callback.answer()
-
-    settings = get_user_settings(
-        callback.from_user.id
-    )
-
+    user_id = callback.from_user.id
+    if not is_user_active(user_id):
+        await callback.message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
+    settings = get_user_settings(user_id)
     symbol = settings["symbol"]
     timeframe = settings["timeframe"]
-
     await callback.message.answer(
         "⏳ Получаю рыночные данные...\n\n"
         f"💱 {symbol}\n"
         f"⏱ {timeframe}\n\n"
         "🕯 Загружаю до 500 свечей..."
     )
-
     try:
-
         market = await forex_service.get_market(
             symbol=symbol,
             timeframe=timeframe,
             limit=500,
         )
-
         if len(market.candles) < 50:
-
             raise RuntimeError(
                 "Недостаточно свечей для технического анализа: "
                 f"{len(market.candles)}."
             )
-
         await callback.message.answer(
             f"🕯 Получено свечей: "
             f"{len(market.candles)}\n\n"
             "🧮 Рассчитываю индикаторы..."
         )
-
         indicator_engine = IndicatorEngine(
             market.candles
         )
-
         indicators = (
             indicator_engine.calculate_all()
         )
-
         await callback.message.answer(
             "🤖 Анализирую сигнал..."
         )
-
         result = signal_engine.analyze(
             indicators
         )
-
         await callback.message.answer(
             format_signal(
                 result=result,
@@ -777,44 +731,41 @@ async def signal_callback(
                 timeframe=timeframe,
             )
         )
-
     except Exception as exc:
-
         await callback.message.answer(
             "❌ Ошибка формирования сигнала.\n\n"
             f"Причина: {exc}"
         )
-
-
 # ============================================================
 # ANALYSIS CALLBACK
 # ============================================================
-
 @dp.callback_query(F.data == "analysis")
 async def analysis_callback(
     callback: CallbackQuery,
 ):
-
     await callback.answer()
-
+    user_id = callback.from_user.id
+    if not is_user_active(user_id):
+        await callback.message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     status = forex_service.status()
-
     connected = status.get(
         "connected",
         False,
     )
-
     authenticated = status.get(
         "authenticated",
         False,
     )
-
     market_status = (
         "🟢 ONLINE"
         if connected and authenticated
         else "🟡 CONNECTING / OFFLINE"
     )
-
     await callback.message.answer(
         "📊 Анализ рынка\n\n"
         f"📡 Market Data Layer: "
@@ -824,58 +775,53 @@ async def analysis_callback(
         "Источник: Pocket Option WebSocket\n\n"
         "Автоматическая торговля отключена."
     )
-
-
 # ============================================================
 # STATUS CALLBACK
 # ============================================================
-
 @dp.callback_query(F.data == "status")
 async def status_callback(
     callback: CallbackQuery,
 ):
-
     await callback.answer()
-
+    user_id = callback.from_user.id
+    if not is_user_active(user_id):
+        await callback.message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     status = forex_service.status()
-
     connected = status.get(
         "connected",
         False,
     )
-
     authenticated = status.get(
         "authenticated",
         False,
     )
-
     started = status.get(
         "started",
         False,
     )
-
     market_status = (
         "🟢 ONLINE"
         if connected and authenticated
         else "🔴 OFFLINE"
     )
-
     runtime_status = (
         "🟢 RUNNING"
         if started
         else "🔴 STOPPED"
     )
-
     subscriptions = status.get(
         "subscriptions",
         {},
     )
-
     known_symbols = status.get(
         "known_symbols",
         [],
     )
-
     text = (
         "📋 СТАТУС СИСТЕМЫ\n\n"
         "🤖 Telegram Bot: 🟢 ONLINE\n\n"
@@ -893,68 +839,54 @@ async def status_callback(
         "⚠️ Автоматическое открытие "
         "сделок отключено."
     )
-
     await callback.message.answer(text)
-
-
 # ============================================================
 # INDICATORS CALLBACK
 # ============================================================
-
 @dp.callback_query(F.data == "indicators")
 async def indicators_callback(
     callback: CallbackQuery,
 ):
-
-    # --------------------------------------------------------
-    # Подтверждаем callback до долгого запроса
-    # рыночных данных.
-    # --------------------------------------------------------
     await callback.answer()
-
-    settings = get_user_settings(
-        callback.from_user.id
-    )
-
+    user_id = callback.from_user.id
+    if not is_user_active(user_id):
+        await callback.message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
+    settings = get_user_settings(user_id)
     symbol = settings["symbol"]
     timeframe = settings["timeframe"]
-
     await callback.message.answer(
         "⏳ Получаю рыночные данные...\n\n"
         f"💱 {symbol}\n"
         f"⏱ {timeframe}\n\n"
         "🕯 Загружаю до 500 свечей..."
     )
-
     try:
-
         market = await forex_service.get_market(
             symbol=symbol,
             timeframe=timeframe,
             limit=500,
         )
-
         if len(market.candles) < 50:
-
             raise RuntimeError(
                 "Недостаточно свечей для расчёта "
                 f"индикаторов: {len(market.candles)}."
             )
-
         await callback.message.answer(
             f"🕯 Получено свечей: "
             f"{len(market.candles)}\n\n"
             "🧮 Рассчитываю технические индикаторы..."
         )
-
         indicator_engine = IndicatorEngine(
             market.candles
         )
-
         indicators = (
             indicator_engine.calculate_all()
         )
-
         await callback.message.answer(
             format_indicators(
                 indicators=indicators,
@@ -962,30 +894,28 @@ async def indicators_callback(
                 timeframe=timeframe,
             )
         )
-
     except Exception as exc:
-
         await callback.message.answer(
             "❌ Ошибка расчёта индикаторов.\n\n"
             f"Причина: {exc}"
         )
-
-
 # ============================================================
 # SETTINGS CALLBACK
 # ============================================================
-
 @dp.callback_query(F.data == "settings")
 async def settings_callback(
     callback: CallbackQuery,
 ):
-
     await callback.answer()
-
-    settings = get_user_settings(
-        callback.from_user.id
-    )
-
+    user_id = callback.from_user.id
+    if not is_user_active(user_id):
+        await callback.message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
+    settings = get_user_settings(user_id)
     await callback.message.answer(
         "⚙️ НАСТРОЙКИ\n\n"
         f"💱 Инструмент: "
@@ -995,168 +925,161 @@ async def settings_callback(
         "Источник данных:\n"
         "📡 Pocket Option WebSocket\n\n"
         "Выберите параметр для изменения:",
-        reply_markup=settings_menu(
-            callback.from_user.id
-        ),
+        reply_markup=settings_menu(user_id),
     )
-
-
 # ============================================================
 # SELECT SYMBOL
 # ============================================================
-
 @dp.callback_query(
     F.data == "select_symbol"
 )
 async def select_symbol_callback(
     callback: CallbackQuery,
 ):
-
     await callback.answer()
-
+    user_id = callback.from_user.id
+    if not is_user_active(user_id):
+        await callback.message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     await callback.message.answer(
         "💱 Выберите инструмент Pocket Option:",
         reply_markup=symbol_menu(),
     )
-
-
 # ============================================================
 # SAVE SYMBOL
 # ============================================================
-
 @dp.callback_query(
     F.data.startswith("symbol:")
 )
 async def save_symbol_callback(
     callback: CallbackQuery,
 ):
-
+    user_id = callback.from_user.id
+    if not is_user_active(user_id):
+        await callback.answer(
+            "⏹️ Сначала нажмите «Старт».",
+            show_alert=True,
+        )
+        return
     symbol = callback.data.split(
         ":",
         1,
     )[1]
-
     allowed_symbols = get_pocket_symbols()
-
     if symbol not in allowed_symbols:
-
         await callback.answer(
             "❌ Недопустимый инструмент.",
             show_alert=True,
         )
-
         return
-
-    settings = get_user_settings(
-        callback.from_user.id
-    )
-
+    settings = get_user_settings(user_id)
     settings["symbol"] = symbol
-
     await callback.message.answer(
         f"✅ Инструмент изменён:\n"
         f"💱 {symbol}",
-        reply_markup=settings_menu(
-            callback.from_user.id
-        ),
+        reply_markup=settings_menu(user_id),
     )
-
     await callback.answer()
-
-
 # ============================================================
 # SELECT TIMEFRAME
 # ============================================================
-
 @dp.callback_query(
     F.data == "select_timeframe"
 )
 async def select_timeframe_callback(
     callback: CallbackQuery,
 ):
-
     await callback.answer()
-
+    user_id = callback.from_user.id
+    if not is_user_active(user_id):
+        await callback.message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     await callback.message.answer(
         "⏱ Выберите таймфрейм:",
         reply_markup=timeframe_menu(),
     )
-
-
 # ============================================================
 # SAVE TIMEFRAME
 # ============================================================
-
 @dp.callback_query(
     F.data.startswith("timeframe:")
 )
 async def save_timeframe_callback(
     callback: CallbackQuery,
 ):
-
+    user_id = callback.from_user.id
+    if not is_user_active(user_id):
+        await callback.answer(
+            "⏹️ Сначала нажмите «Старт».",
+            show_alert=True,
+        )
+        return
     timeframe = callback.data.split(
         ":",
         1,
     )[1]
-
     if timeframe not in TIMEFRAMES:
-
         await callback.answer(
             "❌ Недопустимый таймфрейм.",
             show_alert=True,
         )
-
         return
-
-    settings = get_user_settings(
-        callback.from_user.id
-    )
-
+    settings = get_user_settings(user_id)
     settings["timeframe"] = timeframe
-
     await callback.message.answer(
         f"✅ Таймфрейм изменён:\n"
         f"⏱ {timeframe}",
-        reply_markup=settings_menu(
-            callback.from_user.id
-        ),
+        reply_markup=settings_menu(user_id),
     )
-
     await callback.answer()
-
-
 # ============================================================
 # MAIN MENU CALLBACK
 # ============================================================
-
 @dp.callback_query(
     F.data == "main_menu"
 )
 async def main_menu_callback(
     callback: CallbackQuery,
 ):
-
     await callback.answer()
-
+    user_id = callback.from_user.id
+    if not is_user_active(user_id):
+        await callback.message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     await callback.message.answer(
         "Главное меню:",
         reply_markup=main_menu(),
     )
-
-
 # ============================================================
 # ABOUT CALLBACK
 # ============================================================
-
 @dp.callback_query(
     F.data == "about"
 )
 async def about_callback(
     callback: CallbackQuery,
 ):
-
     await callback.answer()
-
+    user_id = callback.from_user.id
+    if not is_user_active(user_id):
+        await callback.message.answer(
+            "⏹️ Бот остановлен.\n\n"
+            "Нажмите «🟢 Старт», чтобы продолжить.",
+            reply_markup=control_menu(),
+        )
+        return
     await callback.message.answer(
         "ℹ️ PocketTradeSignalsBot\n\n"
         "Аналитический Telegram-бот.\n\n"
@@ -1171,117 +1094,85 @@ async def about_callback(
         "⚠️ Автоматическое открытие "
         "сделок отключено."
     )
-
-
 # ============================================================
 # UNKNOWN CALLBACK SAFETY
 # ============================================================
-
 @dp.callback_query()
 async def unknown_callback(
     callback: CallbackQuery,
 ):
-
     try:
-
         await callback.answer(
             "⚠️ Неизвестная команда.",
             show_alert=False,
         )
-
     except Exception:
         pass
-
-
 # ============================================================
 # MAIN
 # ============================================================
-
 async def main():
-
     print(
         "========================================"
     )
-
     print(
         "PocketTradeSignalsBot started"
     )
-
     print(
         "========================================"
     )
-
     print(
         "Market data source: "
         "Pocket Option WebSocket"
     )
-
     print(
         f"DEFAULT_SYMBOL={DEFAULT_SYMBOL}"
     )
-
     print(
         f"DEFAULT_TIMEFRAME={DEFAULT_TIMEFRAME}"
     )
-
     print(
         "Automatic trading: DISABLED"
     )
-
+    print(
+        "User Start/Stop mode: ENABLED"
+    )
     print(
         "========================================"
     )
-
     try:
-
         # --------------------------------------------------------
         # HTTP health server для Hostless.
         # --------------------------------------------------------
-
         await start_health_server()
-
         # --------------------------------------------------------
         # Запускаем WebSocket data layer.
         # --------------------------------------------------------
-
         await forex_service.start()
-
         print(
             "Pocket Option WebSocket service started"
         )
-
         # --------------------------------------------------------
         # Telegram polling.
         # --------------------------------------------------------
-
         await bot.delete_webhook(
             drop_pending_updates=True
         )
-
         await dp.start_polling(
             bot
         )
-
     finally:
-
         # --------------------------------------------------------
         # Корректно закрываем WebSocket.
         # --------------------------------------------------------
-
         await forex_service.stop()
-
         # --------------------------------------------------------
         # Останавливаем HTTP health server.
         # --------------------------------------------------------
-
         await stop_health_server()
-
         await bot.session.close()
-
-
 # ============================================================
 # RUN
 # ============================================================
-
 if __name__ == "__main__":
     asyncio.run(main())
