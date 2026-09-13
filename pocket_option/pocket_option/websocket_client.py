@@ -323,13 +323,20 @@ class PocketOptionWebSocketClient:
             await self._send_socketio_connect()
             await self._wait_socketio_connect()
 
-            await self.send_auth()
-
+            # ВАЖНО:
+            # Reader должен быть запущен ДО AUTH.
+            #
+            # Pocket Option может отправить
+            # 42["auth/success"] практически сразу
+            # после AUTH. Если Reader запустить после
+            # send_auth(), этот пакет можно пропустить.
             self.connected = True
 
             self.reader_task = asyncio.create_task(
                 self._reader_loop()
             )
+
+            await self.send_auth()
 
         except Exception:
             if self.session is not None:
