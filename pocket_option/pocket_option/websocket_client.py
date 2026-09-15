@@ -323,18 +323,20 @@ class PocketOptionWebSocketClient:
             await self._send_socketio_connect()
             await self._wait_socketio_connect()
 
-            # ВАЖНО:
-            # Reader должен быть запущен ДО AUTH.
-            #
-            # Pocket Option может отправить
-            # 42["auth/success"] практически сразу
-            # после AUTH. Если Reader запустить после
-            # send_auth(), этот пакет можно пропустить.
             self.connected = True
 
+            # ВАЖНО:
+            # Reader запускается ДО AUTH.
+            #
+            # create_task() только планирует задачу.
+            # sleep(0) передаёт управление event loop,
+            # чтобы Reader реально успел начать работу
+            # до отправки AUTH.
             self.reader_task = asyncio.create_task(
                 self._reader_loop()
             )
+
+            await asyncio.sleep(0)
 
             await self.send_auth()
 
@@ -566,6 +568,18 @@ class PocketOptionWebSocketClient:
             )
         )
 
+        # Диагностика точного пакета.
+        # SSID здесь будет виден в открытом виде,
+        # поэтому эту строку НЕ следует публиковать
+        # вместе с реальным логом без маскировки.
+        print(
+            f"[PO] AUTH PACKET REPR: {packet!r}"
+        )
+
+        print(
+            f"[PO] AUTH PACKET LENGTH: {len(packet)}"
+        )
+
         await self.ws.send_str(packet)
 
         print(
@@ -671,7 +685,6 @@ class PocketOptionWebSocketClient:
             self.connected = False
             self.socketio_connected = False
             self.authenticated = False
-            self.auth_event.clear()
 
             print(
                 "[PO] Reader остановлен"
@@ -707,10 +720,21 @@ class PocketOptionWebSocketClient:
         if data.startswith("41"):
             self.socketio_connected = False
             self.authenticated = False
-            self.auth_event.clear()
+
+            self.last_error = (
+                "Pocket Option Socket.IO DISCONNECT (41) "
+                "immediately after AUTH"
+            )
+
+            self.auth_event.set()
 
             print(
                 "[PO] ← Socket.IO DISCONNECT (41)"
+            )
+
+            print(
+                "[PO] AUTH DISCONNECT ERROR: "
+                f"{self.last_error}"
             )
 
             return
@@ -1600,7 +1624,6 @@ class PocketOptionWebSocketClient:
                 if not self.connected:
                     self.socketio_connected = False
                     self.authenticated = False
-                    self.auth_event.clear()
 
             if not reconnect:
                 return
