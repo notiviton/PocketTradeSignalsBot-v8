@@ -15,6 +15,7 @@ Pocket Option WebSocket client.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -85,7 +86,7 @@ class PocketOptionWebSocketClient:
 
     DEFAULT_LANG = "ru"
 
-    # Значение, подтверждённое браузерным WebSocket.
+    # Подтверждено рабочим браузерным WebSocket.
     DEFAULT_CURRENT_URL = "cabinet"
 
     PING_INTERVAL = 25
@@ -107,7 +108,12 @@ class PocketOptionWebSocketClient:
         is_chart: bool = True,
         tick_callback: TickCallback = None,
     ) -> None:
-        self.ssid = (
+
+        # ------------------------------------------------------------
+        # CONFIG
+        # ------------------------------------------------------------
+
+        raw_ssid = (
             ssid
             if ssid is not None
             else os.getenv(
@@ -116,7 +122,13 @@ class PocketOptionWebSocketClient:
             )
         )
 
-        self.uid = (
+        self.ssid = str(
+            raw_ssid
+            if raw_ssid is not None
+            else ""
+        ).strip()
+
+        raw_uid = (
             uid
             if uid is not None
             else os.getenv(
@@ -125,7 +137,13 @@ class PocketOptionWebSocketClient:
             )
         )
 
-        self.ws_url = (
+        self.uid = str(
+            raw_uid
+            if raw_uid is not None
+            else ""
+        ).strip()
+
+        raw_ws_url = (
             ws_url
             if ws_url is not None
             else os.getenv(
@@ -134,7 +152,13 @@ class PocketOptionWebSocketClient:
             )
         )
 
-        self.lang = (
+        self.ws_url = str(
+            raw_ws_url
+            if raw_ws_url is not None
+            else self.DEFAULT_WS_URL
+        ).strip()
+
+        raw_lang = (
             lang
             if lang is not None
             else os.getenv(
@@ -143,7 +167,13 @@ class PocketOptionWebSocketClient:
             )
         )
 
-        self.current_url = (
+        self.lang = str(
+            raw_lang
+            if raw_lang is not None
+            else self.DEFAULT_LANG
+        ).strip()
+
+        raw_current_url = (
             current_url
             if current_url is not None
             else os.getenv(
@@ -152,21 +182,39 @@ class PocketOptionWebSocketClient:
             )
         )
 
+        self.current_url = str(
+            raw_current_url
+            if raw_current_url is not None
+            else self.DEFAULT_CURRENT_URL
+        ).strip()
+
+        if not self.current_url:
+            self.current_url = (
+                self.DEFAULT_CURRENT_URL
+            )
+
         env_is_chart = os.getenv(
             "POCKET_OPTION_IS_CHART"
         )
 
         if env_is_chart is not None:
-            self.is_chart = env_is_chart.lower() not in {
-                "0",
-                "false",
-                "no",
-                "off",
-            }
+            self.is_chart = (
+                env_is_chart.strip().lower()
+                not in {
+                    "0",
+                    "false",
+                    "no",
+                    "off",
+                }
+            )
         else:
             self.is_chart = bool(is_chart)
 
         self.tick_callback = tick_callback
+
+        # ------------------------------------------------------------
+        # CONNECTION STATE
+        # ------------------------------------------------------------
 
         self.session: aiohttp.ClientSession | None = None
         self.ws: aiohttp.ClientWebSocketResponse | None = None
@@ -186,14 +234,18 @@ class PocketOptionWebSocketClient:
         self.ping_interval = self.PING_INTERVAL
         self.ping_timeout = self.PING_TIMEOUT
 
+        # Событие всегда очищается перед новой AUTH.
         self.auth_event = asyncio.Event()
 
-        # Время отправки последней AUTH.
-        # Используется только для диагностики ответа 41.
+        # Время отправки AUTH.
         self.auth_sent_at: float | None = None
 
         # Номер AUTH-попытки.
         self.auth_attempt = 0
+
+        # ------------------------------------------------------------
+        # DATA
+        # ------------------------------------------------------------
 
         self.ticks: dict[
             str,
@@ -217,6 +269,40 @@ class PocketOptionWebSocketClient:
                 list[PocketOptionCandle]
             ],
         ] = {}
+
+    # ================================================================
+    # SAFE DIAGNOSTICS
+    # ================================================================
+
+    def _ssid_fingerprint(self) -> str:
+        """
+        Безопасный SHA-256 отпечаток SSID.
+
+        Сам токен никогда не выводится.
+        """
+
+        if not self.ssid:
+            return "<empty>"
+
+        return hashlib.sha256(
+            self.ssid.encode("utf-8")
+        ).hexdigest()[:16]
+
+    def _ssid_debug_info(self) -> dict[str, Any]:
+        """Безопасная информация о SSID."""
+
+        return {
+            "length": len(self.ssid),
+            "sha256_16": self._ssid_fingerprint(),
+            "has_leading_space": (
+                bool(self.ssid)
+                and self.ssid[0].isspace()
+            ),
+            "has_trailing_space": (
+                bool(self.ssid)
+                and self.ssid[-1].isspace()
+            ),
+        }
 
     # ================================================================
     # HELPERS
@@ -312,6 +398,23 @@ class PocketOptionWebSocketClient:
         if self.connected:
             return
 
+        # Всегда очищаем входные параметры.
+        self.ssid = str(
+            self.ssid
+        ).strip()
+
+        self.uid = str(
+            self.uid
+        ).strip()
+
+        self.lang = str(
+            self.lang
+        ).strip()
+
+        self.current_url = str(
+            self.current_url
+        ).strip()
+
         if not self.ssid:
             raise PocketOptionWebSocketError(
                 "POCKET_OPTION_SSID is not configured"
@@ -322,18 +425,63 @@ class PocketOptionWebSocketClient:
                 "POCKET_OPTION_UID is not configured"
             )
 
-        # Очень важно:
-        # новая попытка подключения не должна использовать
-        # старое состояние успешной AUTH.
+        if not self.ws_url:
+            raise PocketOptionWebSocketError(
+                "POCKET_OPTION_WS_URL is not configured"
+            )
+
+        # ------------------------------------------------------------
+        # NEW CONNECTION STATE
+        # ------------------------------------------------------------
+
         self.auth_event.clear()
+
         self.authenticated = False
         self.socketio_connected = False
         self.connected = False
+
+        self.engine_sid = None
+        self.socketio_sid = None
+
         self.auth_sent_at = None
 
         print(
             "[PO] Подключение к WebSocket: "
             f"{self.ws_url}"
+        )
+
+        print(
+            "[PO] CONFIG:"
+        )
+
+        print(
+            "[PO]   uid="
+            f"{self._get_uid()}"
+        )
+
+        print(
+            "[PO]   lang="
+            f"{self.lang}"
+        )
+
+        print(
+            "[PO]   currentUrl="
+            f"{self.current_url}"
+        )
+
+        print(
+            "[PO]   isChart="
+            f"{1 if self.is_chart else 0}"
+        )
+
+        print(
+            "[PO]   SSID length="
+            f"{len(self.ssid)}"
+        )
+
+        print(
+            "[PO]   SSID SHA256="
+            f"{self._ssid_fingerprint()}"
         )
 
         headers = {
@@ -364,7 +512,15 @@ class PocketOptionWebSocketClient:
                 "[PO] Соединение WebSocket установлено"
             )
 
+            # --------------------------------------------------------
+            # ENGINE.IO
+            # --------------------------------------------------------
+
             await self._wait_engine_open()
+
+            # --------------------------------------------------------
+            # SOCKET.IO CONNECT
+            # --------------------------------------------------------
 
             await self._send_socketio_connect()
 
@@ -372,11 +528,17 @@ class PocketOptionWebSocketClient:
 
             self.connected = True
 
+            # Reader должен быть запущен ДО AUTH,
+            # чтобы 41 / auth/success не потерялись.
             self.reader_task = asyncio.create_task(
                 self._reader_loop()
             )
 
             await asyncio.sleep(0)
+
+            # --------------------------------------------------------
+            # AUTH
+            # --------------------------------------------------------
 
             await self.send_auth()
 
@@ -554,7 +716,8 @@ class PocketOptionWebSocketClient:
 
                 if data.startswith("41"):
                     raise PocketOptionWebSocketError(
-                        "Socket.IO connection rejected"
+                        "Socket.IO connection rejected "
+                        "before AUTH"
                     )
 
             elif message.type in {
@@ -574,29 +737,62 @@ class PocketOptionWebSocketClient:
     async def send_auth(
         self,
     ) -> None:
-        """Отправляет AUTH в формате браузера."""
+        """
+        Отправляет AUTH в современном браузерном формате.
+
+        ВАЖНО:
+        Не используется старый формат:
+            session
+            isDemo
+            platform
+
+        Используется подтверждённый браузером формат:
+            sessionToken
+            uid
+            lang
+            currentUrl
+            isChart
+        """
 
         if self.ws is None:
             raise PocketOptionWebSocketError(
                 "WebSocket is not initialized"
             )
 
-        # Новая AUTH = новое ожидание.
-        # Это исправляет использование старого Event
-        # после предыдущего подключения.
+        if not self.socketio_connected:
+            raise PocketOptionWebSocketError(
+                "Socket.IO is not connected before AUTH"
+            )
+
+        # Нормализуем SSID непосредственно перед AUTH.
+        self.ssid = str(
+            self.ssid
+        ).strip()
+
+        if not self.ssid:
+            raise PocketOptionWebSocketError(
+                "POCKET_OPTION_SSID is empty before AUTH"
+            )
+
         self.auth_event.clear()
         self.authenticated = False
         self.last_error = None
 
         self.auth_attempt += 1
 
+        uid = self._get_uid()
+
         payload = {
             "sessionToken": self.ssid,
-            "uid": self._get_uid(),
+            "uid": uid,
             "lang": self.lang,
             "currentUrl": self.current_url,
             "isChart": 1 if self.is_chart else 0,
         }
+
+        # ------------------------------------------------------------
+        # SAFE DEBUG
+        # ------------------------------------------------------------
 
         debug_payload = dict(payload)
 
@@ -633,20 +829,37 @@ class PocketOptionWebSocketClient:
         )
 
         print(
+            "[PO] AUTH SSID INFO: "
+            + json.dumps(
+                self._ssid_debug_info(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
+        print(
             "[PO] AUTH uid type: "
-            f"{type(payload['uid']).__name__}"
+            f"{type(uid).__name__}"
+        )
+
+        # ------------------------------------------------------------
+        # EXACT SOCKET.IO PACKET
+        # ------------------------------------------------------------
+
+        socketio_payload = [
+            "auth",
+            payload,
+        ]
+
+        encoded_payload = json.dumps(
+            socketio_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
 
         packet = (
             "42"
-            + json.dumps(
-                [
-                    "auth",
-                    payload,
-                ],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            + encoded_payload
         )
 
         print(
@@ -654,18 +867,35 @@ class PocketOptionWebSocketClient:
             f"{len(packet)}"
         )
 
-        # Запоминаем момент непосредственно перед отправкой.
+        print(
+            "[PO] AUTH PACKET PREFIX: "
+            f"{packet[:40]}"
+        )
+
+        # Время непосредственно перед send_str().
         self.auth_sent_at = time.monotonic()
 
-        await self.ws.send_str(packet)
+        try:
+            await self.ws.send_str(
+                packet
+            )
+        except Exception as exc:
+            self.last_error = (
+                "AUTH send failed: "
+                f"{exc}"
+            )
+
+            raise PocketOptionWebSocketError(
+                self.last_error
+            ) from exc
 
         print(
             "[PO] → AUTH "
             f"(attempt={self.auth_attempt}, "
-            f"uid={payload['uid']}, "
-            f"lang={payload['lang']}, "
-            f"isChart={payload['isChart']}, "
-            f"currentUrl={payload['currentUrl']})"
+            f"uid={uid}, "
+            f"lang={self.lang}, "
+            f"isChart={1 if self.is_chart else 0}, "
+            f"currentUrl={self.current_url})"
         )
 
         print(
@@ -688,9 +918,13 @@ class PocketOptionWebSocketClient:
             )
 
         except asyncio.TimeoutError as exc:
-            raise PocketOptionWebSocketError(
+            self.last_error = (
                 "authentication timeout: "
                 "successauth не получен"
+            )
+
+            raise PocketOptionWebSocketError(
+                self.last_error
             ) from exc
 
         if not self.authenticated:
@@ -790,19 +1024,39 @@ class PocketOptionWebSocketClient:
             f"{data}"
         )
 
+        # ------------------------------------------------------------
+        # ENGINE.IO PING
+        # ------------------------------------------------------------
+
         if data == "2":
             await self._send_engine_pong()
             return
 
+        # ------------------------------------------------------------
+        # ENGINE.IO PONG
+        # ------------------------------------------------------------
+
         if data == "3":
             return
+
+        # ------------------------------------------------------------
+        # ENGINE.IO OPEN
+        # ------------------------------------------------------------
 
         if data.startswith("0"):
             return
 
+        # ------------------------------------------------------------
+        # SOCKET.IO CONNECT
+        # ------------------------------------------------------------
+
         if data.startswith("40"):
             self.socketio_connected = True
             return
+
+        # ------------------------------------------------------------
+        # SOCKET.IO DISCONNECT
+        # ------------------------------------------------------------
 
         if data.startswith("41"):
             self.socketio_connected = False
@@ -817,7 +1071,6 @@ class PocketOptionWebSocketClient:
                 ) * 1000.0
 
             close_code: int | None = None
-            close_reason: str | None = None
             ws_exception: str | None = None
 
             if self.ws is not None:
@@ -850,6 +1103,9 @@ class PocketOptionWebSocketClient:
                 f"uid={self._get_uid()}; "
                 f"currentUrl={self.current_url}; "
                 f"isChart={1 if self.is_chart else 0}; "
+                f"ssid_length={len(self.ssid)}; "
+                f"ssid_sha256={self._ssid_fingerprint()}; "
+                f"auth_packet_state=sent; "
                 f"close_code={close_code}; "
                 f"ws_exception={ws_exception}"
             )
@@ -900,6 +1156,16 @@ class PocketOptionWebSocketClient:
             )
 
             print(
+                "[PO]   ssid_length="
+                f"{len(self.ssid)}"
+            )
+
+            print(
+                "[PO]   ssid_sha256="
+                f"{self._ssid_fingerprint()}"
+            )
+
+            print(
                 "[PO]   close_code="
                 f"{close_code}"
             )
@@ -915,6 +1181,10 @@ class PocketOptionWebSocketClient:
             )
 
             return
+
+        # ------------------------------------------------------------
+        # SOCKET.IO EVENT
+        # ------------------------------------------------------------
 
         if data.startswith("42"):
             await self._handle_socketio_event(
@@ -971,6 +1241,10 @@ class PocketOptionWebSocketClient:
             else None
         )
 
+        # ------------------------------------------------------------
+        # AUTH SUCCESS
+        # ------------------------------------------------------------
+
         if event_name in {
             "auth/success",
             "successauth",
@@ -999,6 +1273,10 @@ class PocketOptionWebSocketClient:
 
             return
 
+        # ------------------------------------------------------------
+        # AUTH ERROR
+        # ------------------------------------------------------------
+
         if event_name in {
             "auth/fail",
             "auth/error",
@@ -1020,6 +1298,10 @@ class PocketOptionWebSocketClient:
 
             return
 
+        # ------------------------------------------------------------
+        # ASSETS
+        # ------------------------------------------------------------
+
         if event_name == "updateAssets":
             self.assets = (
                 event_data
@@ -1037,6 +1319,10 @@ class PocketOptionWebSocketClient:
 
             return
 
+        # ------------------------------------------------------------
+        # STREAM
+        # ------------------------------------------------------------
+
         if event_name == "updateStream":
             await self._handle_update_stream(
                 event_data
@@ -1049,6 +1335,10 @@ class PocketOptionWebSocketClient:
             )
             return
 
+        # ------------------------------------------------------------
+        # HISTORY
+        # ------------------------------------------------------------
+
         if event_name in {
             "updateHistoryNewFast",
             "updateHistory",
@@ -1060,6 +1350,10 @@ class PocketOptionWebSocketClient:
                 event_data,
             )
             return
+
+        # ------------------------------------------------------------
+        # SERVER PING
+        # ------------------------------------------------------------
 
         if event_name in {
             "ping-server",
