@@ -70,7 +70,7 @@ class PocketOptionWebSocketClient:
             "sessionToken": "...",
             "uid": "2249701",
             "lang": "ru",
-            "currentUrl": "cabinet",
+            "currentUrl": "cabinet/quick-high-low/USD",
             "isChart": 1
         }]
     """
@@ -83,7 +83,7 @@ class PocketOptionWebSocketClient:
     DEFAULT_LANG = "ru"
 
     # Подтверждено успешным браузерным подключением.
-    DEFAULT_CURRENT_URL = "cabinet"
+    DEFAULT_CURRENT_URL = "cabinet/quick-high-low/USD"
 
     PING_INTERVAL = 25
     PING_TIMEOUT = 20
@@ -566,14 +566,6 @@ class PocketOptionWebSocketClient:
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-        )
-
-        # Диагностика точного пакета.
-        # SSID здесь будет виден в открытом виде,
-        # поэтому эту строку НЕ следует публиковать
-        # вместе с реальным логом без маскировки.
-        print(
-            f"[PO] AUTH PACKET REPR: {packet!r}"
         )
 
         print(
