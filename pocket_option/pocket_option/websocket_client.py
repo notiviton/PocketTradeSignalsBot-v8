@@ -255,13 +255,7 @@ class PocketOptionWebSocketClient:
         # SERVER TIME
         # ============================================================
 
-        # Разница:
-        #
-        #     server_time - local_time
-        #
-        # Нужна для корректного поля "time" в history request.
         self.server_time_offset = 0.0
-
         self.server_time_synced = False
 
         # ============================================================
@@ -481,11 +475,7 @@ class PocketOptionWebSocketClient:
     # ================================================================
 
     async def connect(self) -> None:
-        """
-        Создаёт новое WebSocket-соединение.
-
-        Старое соединение сначала полностью очищается.
-        """
+        """Создаёт новое WebSocket-соединение."""
 
         async with self._connection_lock:
 
@@ -543,7 +533,6 @@ class PocketOptionWebSocketClient:
 
             self.engine_sid = None
             self.socketio_sid = None
-
             self.auth_sent_at = None
 
             self._binary_event = None
@@ -614,10 +603,6 @@ class PocketOptionWebSocketClient:
                     "[PO] Соединение WebSocket установлено"
                 )
 
-                # ----------------------------------------------------
-                # TIME SYNC
-                # ----------------------------------------------------
-
                 try:
                     ws_headers = getattr(
                         self.ws,
@@ -629,21 +614,14 @@ class PocketOptionWebSocketClient:
                         self._sync_time_from_headers(
                             ws_headers
                         )
+
                 except Exception as exc:
                     print(
                         "[PO] Не удалось получить "
                         f"server Date header: {exc}"
                     )
 
-                # ----------------------------------------------------
-                # ENGINE.IO
-                # ----------------------------------------------------
-
                 await self._wait_engine_open()
-
-                # ----------------------------------------------------
-                # SOCKET.IO CONNECT
-                # ----------------------------------------------------
 
                 await self._send_socketio_connect()
 
@@ -651,19 +629,11 @@ class PocketOptionWebSocketClient:
 
                 self.connected = True
 
-                # ----------------------------------------------------
-                # READER
-                # ----------------------------------------------------
-
                 self.reader_task = asyncio.create_task(
                     self._reader_loop()
                 )
 
                 await asyncio.sleep(0)
-
-                # ----------------------------------------------------
-                # AUTH
-                # ----------------------------------------------------
 
                 await self.send_auth()
 
@@ -718,8 +688,7 @@ class PocketOptionWebSocketClient:
                         float(
                             info.get(
                                 "pingInterval",
-                                self.PING_INTERVAL
-                                * 1000,
+                                self.PING_INTERVAL * 1000,
                             )
                         )
                         / 1000.0
@@ -729,8 +698,7 @@ class PocketOptionWebSocketClient:
                         float(
                             info.get(
                                 "pingTimeout",
-                                self.PING_TIMEOUT
-                                * 1000,
+                                self.PING_TIMEOUT * 1000,
                             )
                         )
                         / 1000.0
@@ -826,9 +794,7 @@ class PocketOptionWebSocketClient:
                                 dict,
                             ):
                                 self.socketio_sid = (
-                                    info.get(
-                                        "sid"
-                                    )
+                                    info.get("sid")
                                 )
 
                         except json.JSONDecodeError:
@@ -864,9 +830,7 @@ class PocketOptionWebSocketClient:
     async def send_auth(
         self,
     ) -> None:
-        """
-        Отправляет AUTH в современном браузерном формате.
-        """
+        """Отправляет AUTH в современном браузерном формате."""
 
         if self.ws is None:
             raise PocketOptionWebSocketError(
@@ -921,9 +885,7 @@ class PocketOptionWebSocketClient:
         elif token:
             debug_payload["sessionToken"] = "***"
         else:
-            debug_payload["sessionToken"] = (
-                "<empty>"
-            )
+            debug_payload["sessionToken"] = "<empty>"
 
         print(
             "[PO] AUTH DEBUG: "
@@ -983,6 +945,7 @@ class PocketOptionWebSocketClient:
             await self.ws.send_str(
                 packet
             )
+
         except Exception as exc:
             self.last_error = (
                 "AUTH send failed: "
@@ -1140,39 +1103,19 @@ class PocketOptionWebSocketClient:
             f"{data}"
         )
 
-        # ------------------------------------------------------------
-        # ENGINE.IO PING
-        # ------------------------------------------------------------
-
         if data == "2":
             await self._send_engine_pong()
             return
 
-        # ------------------------------------------------------------
-        # ENGINE.IO PONG
-        # ------------------------------------------------------------
-
         if data == "3":
             return
-
-        # ------------------------------------------------------------
-        # ENGINE.IO OPEN
-        # ------------------------------------------------------------
 
         if data.startswith("0"):
             return
 
-        # ------------------------------------------------------------
-        # SOCKET.IO CONNECT
-        # ------------------------------------------------------------
-
         if data.startswith("40"):
             self.socketio_connected = True
             return
-
-        # ------------------------------------------------------------
-        # SOCKET.IO DISCONNECT
-        # ------------------------------------------------------------
 
         if data.startswith("41"):
             self.socketio_connected = False
@@ -1201,6 +1144,7 @@ class PocketOptionWebSocketClient:
                         ws_exception = str(
                             ws_exception_value
                         )
+
                 except Exception:
                     ws_exception = None
 
@@ -1302,24 +1246,11 @@ class PocketOptionWebSocketClient:
 
             return
 
-        # ------------------------------------------------------------
-        # SOCKET.IO BINARY EVENT
-        #
-        # 45<n>-...
-        #
-        # Example:
-        # 451-["loadHistoryPeriod", {...}]
-        # ------------------------------------------------------------
-
         if data.startswith("45"):
             await self._handle_binary_event_header(
                 data
             )
             return
-
-        # ------------------------------------------------------------
-        # SOCKET.IO EVENT
-        # ------------------------------------------------------------
 
         if data.startswith("42"):
             await self._handle_socketio_event(
@@ -1387,10 +1318,6 @@ class PocketOptionWebSocketClient:
         ):
             return
 
-        # ------------------------------------------------------------
-        # AUTH SUCCESS
-        # ------------------------------------------------------------
-
         if event_name in {
             "auth/success",
             "successauth",
@@ -1419,10 +1346,6 @@ class PocketOptionWebSocketClient:
 
             return
 
-        # ------------------------------------------------------------
-        # AUTH ERROR
-        # ------------------------------------------------------------
-
         if event_name in {
             "auth/fail",
             "auth/error",
@@ -1444,10 +1367,6 @@ class PocketOptionWebSocketClient:
 
             return
 
-        # ------------------------------------------------------------
-        # ASSETS
-        # ------------------------------------------------------------
-
         if event_name == "updateAssets":
             self.assets = (
                 event_data
@@ -1465,10 +1384,6 @@ class PocketOptionWebSocketClient:
 
             return
 
-        # ------------------------------------------------------------
-        # STREAM
-        # ------------------------------------------------------------
-
         if event_name == "updateStream":
             await self._handle_update_stream(
                 event_data
@@ -1480,10 +1395,6 @@ class PocketOptionWebSocketClient:
                 event_data
             )
             return
-
-        # ------------------------------------------------------------
-        # HISTORY
-        # ------------------------------------------------------------
 
         if event_name in {
             "updateHistoryNewFast",
@@ -1505,19 +1416,11 @@ class PocketOptionWebSocketClient:
 
             return
 
-        # ------------------------------------------------------------
-        # SERVER PING
-        # ------------------------------------------------------------
-
         if event_name in {
             "ping-server",
             "pong-server",
         }:
             return
-
-        # ------------------------------------------------------------
-        # UNKNOWN EVENT
-        # ------------------------------------------------------------
 
         print(
             "[PO] Необработанный Socket.IO event: "
@@ -1541,18 +1444,7 @@ class PocketOptionWebSocketClient:
         self,
         data: str,
     ) -> None:
-        """
-        Обрабатывает Socket.IO BINARY_EVENT header.
-
-        Формат обычно выглядит как:
-
-            451-[event, data]
-
-        где:
-            5  = BINARY_EVENT
-            1  = количество attachments
-            -  = разделитель
-        """
+        """Обрабатывает Socket.IO BINARY_EVENT header."""
 
         try:
             separator = data.find("-")
@@ -1608,6 +1500,7 @@ class PocketOptionWebSocketClient:
                 await self._dispatch_binary_event(
                     event
                 )
+
                 self._binary_event = None
                 return
 
@@ -1814,8 +1707,6 @@ class PocketOptionWebSocketClient:
 
             return
 
-        # Иногда binary event после восстановления
-        # всё равно содержит обычный JSON.
         if isinstance(
             event_data,
             (dict, list),
@@ -1900,6 +1791,7 @@ class PocketOptionWebSocketClient:
                             else self._server_timestamp()
                         ),
                     )
+
                 except (
                     TypeError,
                     ValueError,
@@ -1915,13 +1807,6 @@ class PocketOptionWebSocketClient:
             try:
                 symbol = data[0]
 
-                # Возможны варианты:
-                #
-                # [asset, price, timestamp]
-                # [asset, timestamp, price]
-                #
-                # Определяем по типу/значению.
-
                 first = float(
                     data[1]
                 )
@@ -1931,14 +1816,13 @@ class PocketOptionWebSocketClient:
                         data[2]
                     )
 
-                    # Timestamp обычно значительно больше
-                    # цены.
                     if first > 1_000_000_000:
                         timestamp = first
                         price = second
                     else:
                         price = first
                         timestamp = second
+
                 else:
                     price = first
                     timestamp = self._server_timestamp()
@@ -2085,11 +1969,17 @@ class PocketOptionWebSocketClient:
         """
         Запрашивает историю свечей.
 
+        Сначала используется:
+            loadHistoryPeriod
+
+        Если сервер не отвечает, выполняется второй запрос:
+            loadHistoryPeriodFast
+
         count:
             Сколько свечей нужно вернуть вызывающему коду.
 
         offset:
-            Сколько свечей просить у сервера.
+            Глубина запроса истории на сервере.
 
         Если offset не задан, используется 9000.
         """
@@ -2150,6 +2040,16 @@ class PocketOptionWebSocketClient:
 
         self._history_waiters[key] = waiter
 
+        if self.ws is None:
+            self._history_waiters.pop(
+                key,
+                None,
+            )
+
+            raise PocketOptionWebSocketError(
+                "WebSocket is not initialized"
+            )
+
         payload = {
             "asset": normalized,
             "index": 0,
@@ -2158,7 +2058,13 @@ class PocketOptionWebSocketClient:
             "period": period,
         }
 
-        packet = (
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        normal_packet = (
             "42"
             + json.dumps(
                 [
@@ -2170,15 +2076,17 @@ class PocketOptionWebSocketClient:
             )
         )
 
-        if self.ws is None:
-            self._history_waiters.pop(
-                key,
-                None,
+        fast_packet = (
+            "42"
+            + json.dumps(
+                [
+                    "loadHistoryPeriodFast",
+                    payload,
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
             )
-
-            raise PocketOptionWebSocketError(
-                "WebSocket is not initialized"
-            )
+        )
 
         print(
             "[PO] HISTORY REQUEST:"
@@ -2214,9 +2122,30 @@ class PocketOptionWebSocketClient:
             f"{self.server_time_offset:+.3f}s"
         )
 
-        await self.ws.send_str(
-            packet
+        print(
+            "[PO]   loadHistoryPeriod payload="
+            f"{payload_json}"
         )
+
+        # ------------------------------------------------------------
+        # FIRST REQUEST
+        # ------------------------------------------------------------
+
+        try:
+            await self.ws.send_str(
+                normal_packet
+            )
+
+        except Exception as exc:
+            self._history_waiters.pop(
+                key,
+                None
+            )
+
+            raise PocketOptionWebSocketError(
+                "History request send failed: "
+                f"{exc}"
+            ) from exc
 
         print(
             "[PO] → loadHistoryPeriod "
@@ -2225,41 +2154,147 @@ class PocketOptionWebSocketClient:
             f"offset={history_offset}"
         )
 
+        # ------------------------------------------------------------
+        # WAIT FOR NORMAL HISTORY
+        #
+        # Оставляем часть общего timeout для обычного запроса.
+        # Если сервер молчит, пробуем Fast.
+        # ------------------------------------------------------------
+
+        total_timeout = max(
+            5.0,
+            float(timeout),
+        )
+
+        fast_started = False
+
         try:
-            result = await asyncio.wait_for(
-                waiter,
-                timeout=timeout,
+            normal_timeout = min(
+                10.0,
+                max(
+                    5.0,
+                    total_timeout * 0.45,
+                ),
             )
 
-            if not result:
-                return []
-
-            return result[
-                -requested_count:
-            ]
-
-        except asyncio.TimeoutError:
-            cached = self.history.get(
-                key,
-                [],
-            )
-
-            if cached:
-                print(
-                    "[PO] History timeout, "
-                    f"используем cache: "
-                    f"{len(cached)}"
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(waiter),
+                    timeout=normal_timeout,
                 )
 
-                return cached[
+                if not result:
+                    return []
+
+                print(
+                    "[PO] History получена через "
+                    "loadHistoryPeriod: "
+                    f"{len(result)} свечей"
+                )
+
+                return result[
                     -requested_count:
                 ]
 
-            raise PocketOptionWebSocketError(
-                "History timeout: "
-                f"{normalized} "
-                f"period={period}"
+            except asyncio.TimeoutError:
+                pass
+
+            # --------------------------------------------------------
+            # SECOND REQUEST: FAST
+            # --------------------------------------------------------
+
+            if (
+                waiter.done()
+                and not waiter.cancelled()
+            ):
+                result = waiter.result()
+
+                if not result:
+                    return []
+
+                return result[
+                    -requested_count:
+                ]
+
+            if self.ws is None:
+                raise PocketOptionWebSocketError(
+                    "WebSocket is not initialized "
+                    "before loadHistoryPeriodFast"
+                )
+
+            fast_started = True
+
+            print(
+                "[PO] loadHistoryPeriod "
+                "не ответил в первом окне."
             )
+
+            print(
+                "[PO] Пробуем "
+                "loadHistoryPeriodFast..."
+            )
+
+            await self.ws.send_str(
+                fast_packet
+            )
+
+            print(
+                "[PO] → loadHistoryPeriodFast "
+                f"asset={normalized} "
+                f"period={period} "
+                f"offset={history_offset}"
+            )
+
+            remaining_timeout = max(
+                5.0,
+                total_timeout - normal_timeout,
+            )
+
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(waiter),
+                    timeout=remaining_timeout,
+                )
+
+                if not result:
+                    return []
+
+                print(
+                    "[PO] History получена через "
+                    "loadHistoryPeriodFast: "
+                    f"{len(result)} свечей"
+                )
+
+                return result[
+                    -requested_count:
+                ]
+
+            except asyncio.TimeoutError:
+                cached = self.history.get(
+                    key,
+                    [],
+                )
+
+                if cached:
+                    print(
+                        "[PO] History timeout после "
+                        f"{'loadHistoryPeriod + ' if fast_started else ''}"
+                        "loadHistoryPeriodFast; "
+                        "используем cache: "
+                        f"{len(cached)}"
+                    )
+
+                    return cached[
+                        -requested_count:
+                    ]
+
+                raise PocketOptionWebSocketError(
+                    "History timeout: "
+                    f"{normalized} "
+                    f"period={period}; "
+                    "tried=loadHistoryPeriod,"
+                    "loadHistoryPeriodFast"
+                )
 
         finally:
             current = (
@@ -2326,6 +2361,7 @@ class PocketOptionWebSocketClient:
                     symbol = self.normalize_symbol(
                         str(raw_symbol)
                     )
+
                 except ValueError:
                     symbol = None
 
@@ -2339,6 +2375,7 @@ class PocketOptionWebSocketClient:
                     period = int(
                         raw_period
                     )
+
                 except (
                     TypeError,
                     ValueError,
@@ -2350,6 +2387,7 @@ class PocketOptionWebSocketClient:
                 candidate_symbol,
                 candidate_period,
             ) in self.subscriptions:
+
                 if (
                     period is None
                     or candidate_period == period
@@ -2427,12 +2465,6 @@ class PocketOptionWebSocketClient:
         raw_items: Any = data
 
         if isinstance(data, dict):
-            # Приоритет:
-            # candles -> history -> data -> result -> items -> values
-            #
-            # В некоторых форматах "history" содержит
-            # метаданные/тики, а "candles" содержит OHLC.
-
             for key in (
                 "candles",
                 "history",
@@ -2483,7 +2515,6 @@ class PocketOptionWebSocketClient:
                 candle.timestamp
         )
 
-        # Удаляем дубликаты timestamp.
         unique: dict[
             int,
             PocketOptionCandle,
@@ -2507,10 +2538,6 @@ class PocketOptionWebSocketClient:
         item: Any,
     ) -> PocketOptionCandle | None:
         """Преобразует один элемент в свечу."""
-
-        # ------------------------------------------------------------
-        # DICT FORMAT
-        # ------------------------------------------------------------
 
         if isinstance(item, dict):
             timestamp = (
@@ -2587,10 +2614,6 @@ class PocketOptionWebSocketClient:
             ):
                 return None
 
-        # ------------------------------------------------------------
-        # ARRAY FORMAT
-        # ------------------------------------------------------------
-
         if isinstance(
             item,
             (list, tuple),
@@ -2614,22 +2637,7 @@ class PocketOptionWebSocketClient:
             ):
                 return None
 
-            # --------------------------------------------------------
-            # Pocket Option historical format встречается также
-            # как:
-            #
-            # [timestamp, open, close, high, low]
-            #
-            # Наш старый код предполагал:
-            #
-            # [timestamp, open, high, low, close]
-            #
-            # Определяем формат по OHLC-ограничениям.
-            # --------------------------------------------------------
-
             candidates = [
-                # Старый/классический:
-                # timestamp, open, high, low, close
                 (
                     a,
                     b,
@@ -2637,9 +2645,6 @@ class PocketOptionWebSocketClient:
                     d,
                     "open-high-low-close",
                 ),
-
-                # Pocket Option:
-                # timestamp, open, close, high, low
                 (
                     a,
                     c,
@@ -2666,6 +2671,7 @@ class PocketOptionWebSocketClient:
                 close_value,
                 fmt,
             ) in candidates:
+
                 if (
                     high_value
                     >= max(
@@ -2692,11 +2698,6 @@ class PocketOptionWebSocketClient:
             if not valid_candidates:
                 return None
 
-            # Если оба формата математически допустимы,
-            # предпочитаем Pocket Option format:
-            #
-            # [timestamp, open, close, high, low]
-            #
             if len(valid_candidates) > 1:
                 selected = next(
                     (
@@ -2726,6 +2727,7 @@ class PocketOptionWebSocketClient:
                     volume = float(
                         item[5]
                     )
+
                 except (
                     TypeError,
                     ValueError,
