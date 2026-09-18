@@ -85,7 +85,7 @@ class PocketOptionWebSocketClient:
 
     DEFAULT_LANG = "ru"
 
-    # Подтверждено рабочим браузерным WebSocket.
+    # Значение, подтверждённое браузерным WebSocket.
     DEFAULT_CURRENT_URL = "cabinet"
 
     PING_INTERVAL = 25
@@ -187,6 +187,13 @@ class PocketOptionWebSocketClient:
         self.ping_timeout = self.PING_TIMEOUT
 
         self.auth_event = asyncio.Event()
+
+        # Время отправки последней AUTH.
+        # Используется только для диагностики ответа 41.
+        self.auth_sent_at: float | None = None
+
+        # Номер AUTH-попытки.
+        self.auth_attempt = 0
 
         self.ticks: dict[
             str,
@@ -314,6 +321,15 @@ class PocketOptionWebSocketClient:
             raise PocketOptionWebSocketError(
                 "POCKET_OPTION_UID is not configured"
             )
+
+        # Очень важно:
+        # новая попытка подключения не должна использовать
+        # старое состояние успешной AUTH.
+        self.auth_event.clear()
+        self.authenticated = False
+        self.socketio_connected = False
+        self.connected = False
+        self.auth_sent_at = None
 
         print(
             "[PO] Подключение к WebSocket: "
@@ -487,7 +503,7 @@ class PocketOptionWebSocketClient:
 
         print(
             "[PO] Ожидание Socket.IO CONNECT "
-            "(40{\"sid\":...})..."
+            "(40{\"sid\":\"...\"})..."
         )
 
         while True:
@@ -565,6 +581,15 @@ class PocketOptionWebSocketClient:
                 "WebSocket is not initialized"
             )
 
+        # Новая AUTH = новое ожидание.
+        # Это исправляет использование старого Event
+        # после предыдущего подключения.
+        self.auth_event.clear()
+        self.authenticated = False
+        self.last_error = None
+
+        self.auth_attempt += 1
+
         payload = {
             "sessionToken": self.ssid,
             "uid": self._get_uid(),
@@ -629,11 +654,15 @@ class PocketOptionWebSocketClient:
             f"{len(packet)}"
         )
 
+        # Запоминаем момент непосредственно перед отправкой.
+        self.auth_sent_at = time.monotonic()
+
         await self.ws.send_str(packet)
 
         print(
             "[PO] → AUTH "
-            f"(uid={payload['uid']}, "
+            f"(attempt={self.auth_attempt}, "
+            f"uid={payload['uid']}, "
             f"lang={payload['lang']}, "
             f"isChart={payload['isChart']}, "
             f"currentUrl={payload['currentUrl']})"
@@ -705,6 +734,12 @@ class PocketOptionWebSocketClient:
                     print(
                         "[PO] WebSocket закрыт"
                     )
+
+                    print(
+                        "[PO] WebSocket close_code="
+                        f"{self.ws.close_code}"
+                    )
+
                     break
 
                 elif message.type == aiohttp.WSMsgType.ERROR:
@@ -773,16 +808,105 @@ class PocketOptionWebSocketClient:
             self.socketio_connected = False
             self.authenticated = False
 
+            elapsed_ms: float | None = None
+
+            if self.auth_sent_at is not None:
+                elapsed_ms = (
+                    time.monotonic()
+                    - self.auth_sent_at
+                ) * 1000.0
+
+            close_code: int | None = None
+            close_reason: str | None = None
+            ws_exception: str | None = None
+
+            if self.ws is not None:
+                close_code = self.ws.close_code
+
+                try:
+                    ws_exception_value = (
+                        self.ws.exception()
+                    )
+
+                    if ws_exception_value is not None:
+                        ws_exception = str(
+                            ws_exception_value
+                        )
+                except Exception:
+                    ws_exception = None
+
+            elapsed_text = (
+                f"{elapsed_ms:.1f} ms"
+                if elapsed_ms is not None
+                else "unknown"
+            )
+
             self.last_error = (
                 "Pocket Option Socket.IO "
-                "DISCONNECT (41) immediately "
-                "after AUTH"
+                "DISCONNECT (41) after AUTH; "
+                f"elapsed={elapsed_text}; "
+                f"engine_sid={self.engine_sid}; "
+                f"socketio_sid={self.socketio_sid}; "
+                f"uid={self._get_uid()}; "
+                f"currentUrl={self.current_url}; "
+                f"isChart={1 if self.is_chart else 0}; "
+                f"close_code={close_code}; "
+                f"ws_exception={ws_exception}"
             )
 
             self.auth_event.set()
 
             print(
                 "[PO] ← Socket.IO DISCONNECT (41)"
+            )
+
+            print(
+                "[PO] AUTH DISCONNECT DIAGNOSTICS:"
+            )
+
+            print(
+                "[PO]   auth_attempt="
+                f"{self.auth_attempt}"
+            )
+
+            print(
+                "[PO]   elapsed="
+                f"{elapsed_text}"
+            )
+
+            print(
+                "[PO]   engine_sid="
+                f"{self.engine_sid}"
+            )
+
+            print(
+                "[PO]   socketio_sid="
+                f"{self.socketio_sid}"
+            )
+
+            print(
+                "[PO]   uid="
+                f"{self._get_uid()}"
+            )
+
+            print(
+                "[PO]   currentUrl="
+                f"{self.current_url}"
+            )
+
+            print(
+                "[PO]   isChart="
+                f"{1 if self.is_chart else 0}"
+            )
+
+            print(
+                "[PO]   close_code="
+                f"{close_code}"
+            )
+
+            print(
+                "[PO]   ws_exception="
+                f"{ws_exception}"
             )
 
             print(
@@ -855,9 +979,23 @@ class PocketOptionWebSocketClient:
             self.authenticated = True
             self.auth_event.set()
 
-            print(
-                "[PO] AUTH SUCCESS"
-            )
+            elapsed_ms: float | None = None
+
+            if self.auth_sent_at is not None:
+                elapsed_ms = (
+                    time.monotonic()
+                    - self.auth_sent_at
+                ) * 1000.0
+
+            if elapsed_ms is not None:
+                print(
+                    "[PO] AUTH SUCCESS "
+                    f"after {elapsed_ms:.1f} ms"
+                )
+            else:
+                print(
+                    "[PO] AUTH SUCCESS"
+                )
 
             return
 
@@ -1745,6 +1883,7 @@ class PocketOptionWebSocketClient:
         await self._cleanup_connection()
 
         self.auth_event.clear()
+        self.auth_sent_at = None
 
         print(
             "[PO] WebSocket клиент остановлен"
