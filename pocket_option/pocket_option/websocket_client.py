@@ -77,6 +77,10 @@ class PocketOptionWebSocketClient:
         42["auth/success"]
 
     Автоматическая торговля отсутствует.
+
+    ВАЖНО:
+    После неожиданного DISCONNECT (41), закрытия WebSocket
+    или ошибки reader клиент автоматически выполняет reconnect.
     """
 
     DEFAULT_WS_URL = (
@@ -85,8 +89,6 @@ class PocketOptionWebSocketClient:
     )
 
     DEFAULT_LANG = "ru"
-
-    # Подтверждено рабочим браузерным WebSocket.
     DEFAULT_CURRENT_URL = "cabinet"
 
     PING_INTERVAL = 25
@@ -109,9 +111,9 @@ class PocketOptionWebSocketClient:
         tick_callback: TickCallback = None,
     ) -> None:
 
-        # ------------------------------------------------------------
+        # ============================================================
         # CONFIG
-        # ------------------------------------------------------------
+        # ============================================================
 
         raw_ssid = (
             ssid
@@ -212,14 +214,23 @@ class PocketOptionWebSocketClient:
 
         self.tick_callback = tick_callback
 
-        # ------------------------------------------------------------
+        # ============================================================
         # CONNECTION STATE
-        # ------------------------------------------------------------
+        # ============================================================
 
         self.session: aiohttp.ClientSession | None = None
         self.ws: aiohttp.ClientWebSocketResponse | None = None
 
         self.reader_task: asyncio.Task[None] | None = None
+
+        # Фоновый lifecycle/reconnect task.
+        self.lifecycle_task: asyncio.Task[None] | None = None
+
+        # Защищает connect/cleanup от одновременного выполнения.
+        self._connection_lock = asyncio.Lock()
+
+        # Сигнал для полного остановочного режима.
+        self._stop_event = asyncio.Event()
 
         self.connected = False
         self.socketio_connected = False
@@ -234,18 +245,14 @@ class PocketOptionWebSocketClient:
         self.ping_interval = self.PING_INTERVAL
         self.ping_timeout = self.PING_TIMEOUT
 
-        # Событие всегда очищается перед новой AUTH.
         self.auth_event = asyncio.Event()
 
-        # Время отправки AUTH.
         self.auth_sent_at: float | None = None
-
-        # Номер AUTH-попытки.
         self.auth_attempt = 0
 
-        # ------------------------------------------------------------
+        # ============================================================
         # DATA
-        # ------------------------------------------------------------
+        # ============================================================
 
         self.ticks: dict[
             str,
@@ -393,158 +400,189 @@ class PocketOptionWebSocketClient:
     # ================================================================
 
     async def connect(self) -> None:
-        """Подключается к Pocket Option WebSocket."""
+        """
+        Создаёт новое WebSocket-соединение.
 
-        if self.connected:
-            return
+        Важно:
+        если старое соединение осталось после 41,
+        оно сначала полностью очищается.
+        """
 
-        # Всегда очищаем входные параметры.
-        self.ssid = str(
-            self.ssid
-        ).strip()
+        async with self._connection_lock:
 
-        self.uid = str(
-            self.uid
-        ).strip()
+            if self._stop_event.is_set():
+                raise PocketOptionWebSocketError(
+                    "WebSocket client is stopped"
+                )
 
-        self.lang = str(
-            self.lang
-        ).strip()
+            if (
+                self.connected
+                and self.socketio_connected
+            ):
+                return
 
-        self.current_url = str(
-            self.current_url
-        ).strip()
+            # --------------------------------------------------------
+            # Удаляем потенциально зависшее старое соединение.
+            # --------------------------------------------------------
 
-        if not self.ssid:
-            raise PocketOptionWebSocketError(
-                "POCKET_OPTION_SSID is not configured"
+            await self._cleanup_connection(
+                preserve_lifecycle=True
             )
 
-        if not self.uid:
-            raise PocketOptionWebSocketError(
-                "POCKET_OPTION_UID is not configured"
-            )
+            # --------------------------------------------------------
+            # Нормализация конфигурации.
+            # --------------------------------------------------------
 
-        if not self.ws_url:
-            raise PocketOptionWebSocketError(
-                "POCKET_OPTION_WS_URL is not configured"
-            )
+            self.ssid = str(
+                self.ssid
+            ).strip()
 
-        # ------------------------------------------------------------
-        # NEW CONNECTION STATE
-        # ------------------------------------------------------------
+            self.uid = str(
+                self.uid
+            ).strip()
 
-        self.auth_event.clear()
+            self.lang = str(
+                self.lang
+            ).strip()
 
-        self.authenticated = False
-        self.socketio_connected = False
-        self.connected = False
+            self.current_url = str(
+                self.current_url
+            ).strip()
 
-        self.engine_sid = None
-        self.socketio_sid = None
+            if not self.ssid:
+                raise PocketOptionWebSocketError(
+                    "POCKET_OPTION_SSID is not configured"
+                )
 
-        self.auth_sent_at = None
+            if not self.uid:
+                raise PocketOptionWebSocketError(
+                    "POCKET_OPTION_UID is not configured"
+                )
 
-        print(
-            "[PO] Подключение к WebSocket: "
-            f"{self.ws_url}"
-        )
+            if not self.ws_url:
+                raise PocketOptionWebSocketError(
+                    "POCKET_OPTION_WS_URL is not configured"
+                )
 
-        print(
-            "[PO] CONFIG:"
-        )
+            # --------------------------------------------------------
+            # NEW CONNECTION STATE
+            # --------------------------------------------------------
 
-        print(
-            "[PO]   uid="
-            f"{self._get_uid()}"
-        )
+            self.auth_event.clear()
 
-        print(
-            "[PO]   lang="
-            f"{self.lang}"
-        )
+            self.authenticated = False
+            self.socketio_connected = False
+            self.connected = False
 
-        print(
-            "[PO]   currentUrl="
-            f"{self.current_url}"
-        )
+            self.engine_sid = None
+            self.socketio_sid = None
 
-        print(
-            "[PO]   isChart="
-            f"{1 if self.is_chart else 0}"
-        )
+            self.auth_sent_at = None
 
-        print(
-            "[PO]   SSID length="
-            f"{len(self.ssid)}"
-        )
-
-        print(
-            "[PO]   SSID SHA256="
-            f"{self._ssid_fingerprint()}"
-        )
-
-        headers = {
-            "Origin": "https://pocketoption.com",
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 "
-                "(KHTML, like Gecko) Version/18.0 "
-                "Mobile/15E148 Safari/604.1"
-            ),
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
-
-        self.session = aiohttp.ClientSession(
-            headers=headers
-        )
-
-        try:
-            self.ws = await self.session.ws_connect(
-                self.ws_url,
-                heartbeat=None,
-                autoping=False,
-                receive_timeout=None,
+            print(
+                "[PO] Подключение к WebSocket: "
+                f"{self.ws_url}"
             )
 
             print(
-                "[PO] Соединение WebSocket установлено"
+                "[PO] CONFIG:"
             )
 
-            # --------------------------------------------------------
-            # ENGINE.IO
-            # --------------------------------------------------------
-
-            await self._wait_engine_open()
-
-            # --------------------------------------------------------
-            # SOCKET.IO CONNECT
-            # --------------------------------------------------------
-
-            await self._send_socketio_connect()
-
-            await self._wait_socketio_connect()
-
-            self.connected = True
-
-            # Reader должен быть запущен ДО AUTH,
-            # чтобы 41 / auth/success не потерялись.
-            self.reader_task = asyncio.create_task(
-                self._reader_loop()
+            print(
+                "[PO]   uid="
+                f"{self._get_uid()}"
             )
 
-            await asyncio.sleep(0)
+            print(
+                "[PO]   lang="
+                f"{self.lang}"
+            )
 
-            # --------------------------------------------------------
-            # AUTH
-            # --------------------------------------------------------
+            print(
+                "[PO]   currentUrl="
+                f"{self.current_url}"
+            )
 
-            await self.send_auth()
+            print(
+                "[PO]   isChart="
+                f"{1 if self.is_chart else 0}"
+            )
 
-        except Exception:
-            await self._cleanup_connection()
-            raise
+            print(
+                "[PO]   SSID length="
+                f"{len(self.ssid)}"
+            )
+
+            print(
+                "[PO]   SSID SHA256="
+                f"{self._ssid_fingerprint()}"
+            )
+
+            headers = {
+                "Origin": "https://pocketoption.com",
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 "
+                    "(KHTML, like Gecko) Version/18.0 "
+                    "Mobile/15E148 Safari/604.1"
+                ),
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            }
+
+            self.session = aiohttp.ClientSession(
+                headers=headers
+            )
+
+            try:
+                self.ws = await self.session.ws_connect(
+                    self.ws_url,
+                    heartbeat=None,
+                    autoping=False,
+                    receive_timeout=None,
+                )
+
+                print(
+                    "[PO] Соединение WebSocket установлено"
+                )
+
+                # ----------------------------------------------------
+                # ENGINE.IO
+                # ----------------------------------------------------
+
+                await self._wait_engine_open()
+
+                # ----------------------------------------------------
+                # SOCKET.IO CONNECT
+                # ----------------------------------------------------
+
+                await self._send_socketio_connect()
+
+                await self._wait_socketio_connect()
+
+                self.connected = True
+
+                # ----------------------------------------------------
+                # READER
+                # ----------------------------------------------------
+
+                self.reader_task = asyncio.create_task(
+                    self._reader_loop()
+                )
+
+                await asyncio.sleep(0)
+
+                # ----------------------------------------------------
+                # AUTH
+                # ----------------------------------------------------
+
+                await self.send_auth()
+
+            except Exception:
+                await self._cleanup_connection(
+                    preserve_lifecycle=True
+                )
+                raise
 
     async def _wait_engine_open(
         self,
@@ -740,13 +778,8 @@ class PocketOptionWebSocketClient:
         """
         Отправляет AUTH в современном браузерном формате.
 
-        ВАЖНО:
-        Не используется старый формат:
-            session
-            isDemo
-            platform
-
         Используется подтверждённый браузером формат:
+
             sessionToken
             uid
             lang
@@ -764,7 +797,6 @@ class PocketOptionWebSocketClient:
                 "Socket.IO is not connected before AUTH"
             )
 
-        # Нормализуем SSID непосредственно перед AUTH.
         self.ssid = str(
             self.ssid
         ).strip()
@@ -842,10 +874,6 @@ class PocketOptionWebSocketClient:
             f"{type(uid).__name__}"
         )
 
-        # ------------------------------------------------------------
-        # EXACT SOCKET.IO PACKET
-        # ------------------------------------------------------------
-
         socketio_payload = [
             "auth",
             payload,
@@ -872,7 +900,6 @@ class PocketOptionWebSocketClient:
             f"{packet[:40]}"
         )
 
-        # Время непосредственно перед send_str().
         self.auth_sent_at = time.monotonic()
 
         try:
@@ -910,6 +937,14 @@ class PocketOptionWebSocketClient:
 
         if self.authenticated:
             return
+
+        if (
+            not self.connected
+            or not self.socketio_connected
+        ):
+            raise PocketOptionWebSocketError(
+                "WebSocket is not connected"
+            )
 
         try:
             await asyncio.wait_for(
@@ -1006,6 +1041,12 @@ class PocketOptionWebSocketClient:
             self.connected = False
             self.socketio_connected = False
             self.authenticated = False
+
+            # Если reader завершился неожиданно,
+            # освобождаем ожидающие history-запросы.
+            self._fail_history_waiters(
+                "WebSocket connection lost"
+            )
 
             print(
                 "[PO] Reader остановлен"
@@ -1111,6 +1152,10 @@ class PocketOptionWebSocketClient:
             )
 
             self.auth_event.set()
+
+            self._fail_history_waiters(
+                "Pocket Option Socket.IO DISCONNECT (41)"
+            )
 
             print(
                 "[PO] ← Socket.IO DISCONNECT (41)"
@@ -2112,7 +2157,39 @@ class PocketOptionWebSocketClient:
             ],
             "last_message": self.last_message,
             "last_error": self.last_error,
+            "lifecycle_running": (
+                self.lifecycle_task is not None
+                and not self.lifecycle_task.done()
+            ),
+            "reader_running": (
+                self.reader_task is not None
+                and not self.reader_task.done()
+            ),
         }
+
+    # ================================================================
+    # HISTORY WAITER MANAGEMENT
+    # ================================================================
+
+    def _fail_history_waiters(
+        self,
+        reason: str,
+    ) -> None:
+        """Завершает ожидающие history-запросы ошибкой."""
+
+        for waiter in list(
+            self._history_waiters.values()
+        ):
+            if waiter.done():
+                continue
+
+            waiter.set_exception(
+                PocketOptionWebSocketError(
+                    reason
+                )
+            )
+
+        self._history_waiters.clear()
 
     # ================================================================
     # START / STOP
@@ -2121,45 +2198,218 @@ class PocketOptionWebSocketClient:
     async def start(
         self,
     ) -> None:
-        """Запускает WebSocket-клиент."""
+        """
+        Запускает WebSocket-клиент.
+
+        Первое подключение выполняется синхронно.
+        После него отдельный lifecycle task следит
+        за reader и автоматически переподключается.
+        """
+
+        if (
+            self.connected
+            and self.socketio_connected
+        ):
+            return
+
+        self._stop_event.clear()
+
+        # Первое подключение должно успешно пройти.
         await self.connect()
+
+        # Не создаём второй lifecycle task.
+        if (
+            self.lifecycle_task is None
+            or self.lifecycle_task.done()
+        ):
+            self.lifecycle_task = asyncio.create_task(
+                self._lifecycle_loop()
+            )
+
+            print(
+                "[PO] Lifecycle/reconnect task запущен"
+            )
+
+    async def _lifecycle_loop(
+        self,
+    ) -> None:
+        """
+        Следит за reader.
+
+        Если WebSocket оборвался:
+            reader завершился
+                ↓
+            cleanup
+                ↓
+            reconnect
+                ↓
+            новый AUTH
+        """
+
+        delay = self.RECONNECT_MIN
+
+        try:
+            while not self._stop_event.is_set():
+
+                reader = self.reader_task
+
+                if reader is not None:
+                    try:
+                        await reader
+                    except asyncio.CancelledError:
+                        if self._stop_event.is_set():
+                            return
+
+                    except Exception as exc:
+                        self.last_error = str(exc)
+
+                        print(
+                            "[PO] Lifecycle увидел "
+                            "ошибку reader: "
+                            f"{exc}"
+                        )
+
+                if self._stop_event.is_set():
+                    return
+
+                # Reader уже завершён.
+                self.connected = False
+                self.socketio_connected = False
+                self.authenticated = False
+
+                print(
+                    "[PO] Соединение потеряно. "
+                    "Запускаем reconnect."
+                )
+
+                await self._cleanup_connection(
+                    preserve_lifecycle=True
+                )
+
+                if self._stop_event.is_set():
+                    return
+
+                print(
+                    "[PO] Повторное подключение через "
+                    f"{delay} сек."
+                )
+
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=delay,
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
+
+                try:
+                    await self.connect()
+
+                    delay = self.RECONNECT_MIN
+
+                    print(
+                        "[PO] Reconnect успешен"
+                    )
+
+                except asyncio.CancelledError:
+                    raise
+
+                except Exception as exc:
+                    self.last_error = str(exc)
+
+                    print(
+                        "[PO] Reconnect ошибка: "
+                        f"{exc}"
+                    )
+
+                    delay = min(
+                        delay * 2,
+                        self.RECONNECT_MAX,
+                    )
+
+        except asyncio.CancelledError:
+            if not self._stop_event.is_set():
+                print(
+                    "[PO] Lifecycle task отменён"
+                )
+
+            raise
+
+        finally:
+            print(
+                "[PO] Lifecycle/reconnect task остановлен"
+            )
 
     async def _cleanup_connection(
         self,
+        preserve_lifecycle: bool = False,
     ) -> None:
-        """Безопасно закрывает текущее соединение."""
+        """
+        Безопасно закрывает текущее соединение.
 
-        if self.reader_task is not None:
-            current = asyncio.current_task()
+        preserve_lifecycle=True используется самим
+        lifecycle task, чтобы он случайно не отменил себя.
+        """
 
-            if (
-                self.reader_task is not current
-                and not self.reader_task.done()
-            ):
-                self.reader_task.cancel()
+        current = asyncio.current_task()
 
-                try:
-                    await self.reader_task
-                except asyncio.CancelledError:
-                    pass
+        reader = self.reader_task
 
-            self.reader_task = None
+        if (
+            reader is not None
+            and reader is not current
+            and not reader.done()
+        ):
+            reader.cancel()
 
-        if self.ws is not None:
             try:
-                await self.ws.close()
+                await reader
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
 
+        self.reader_task = None
+
+        # ------------------------------------------------------------
+        # History waiters
+        # ------------------------------------------------------------
+
+        if not preserve_lifecycle:
+            self._fail_history_waiters(
+                "WebSocket connection closed"
+            )
+
+        # ------------------------------------------------------------
+        # WebSocket
+        # ------------------------------------------------------------
+
+        ws = self.ws
         self.ws = None
 
-        if self.session is not None:
+        if ws is not None:
             try:
-                await self.session.close()
+                await ws.close()
             except Exception:
                 pass
 
+        # ------------------------------------------------------------
+        # HTTP session
+        # ------------------------------------------------------------
+
+        session = self.session
         self.session = None
+
+        if session is not None:
+            try:
+                await session.close()
+            except Exception:
+                pass
+
+        # ------------------------------------------------------------
+        # State
+        # ------------------------------------------------------------
 
         self.connected = False
         self.socketio_connected = False
@@ -2168,13 +2418,39 @@ class PocketOptionWebSocketClient:
     async def stop(
         self,
     ) -> None:
-        """Останавливает WebSocket-клиент."""
+        """Полностью останавливает WebSocket-клиент."""
 
         print(
             "[PO] Остановка WebSocket клиента..."
         )
 
-        await self._cleanup_connection()
+        self._stop_event.set()
+
+        lifecycle = self.lifecycle_task
+
+        if (
+            lifecycle is not None
+            and lifecycle is not asyncio.current_task()
+            and not lifecycle.done()
+        ):
+            lifecycle.cancel()
+
+            try:
+                await lifecycle
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        self.lifecycle_task = None
+
+        self._fail_history_waiters(
+            "WebSocket client stopped"
+        )
+
+        await self._cleanup_connection(
+            preserve_lifecycle=False
+        )
 
         self.auth_event.clear()
         self.auth_sent_at = None
@@ -2187,56 +2463,32 @@ class PocketOptionWebSocketClient:
         self,
         reconnect: bool = True,
     ) -> None:
-        """Запускает постоянное подключение."""
+        """
+        Совместимость со старым интерфейсом.
 
-        delay = self.RECONNECT_MIN
+        Основной lifecycle теперь запускается через start().
+        """
 
-        while True:
+        if not reconnect:
+            await self.connect()
+
             try:
-                await self.connect()
-
-                delay = self.RECONNECT_MIN
-
                 if self.reader_task is not None:
                     await self.reader_task
-                else:
-                    return
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as exc:
-                self.last_error = str(
-                    exc
-                )
-
-                print(
-                    "[PO] Ошибка WebSocket: "
-                    f"{exc}"
-                )
-
-                if not reconnect:
-                    raise
-
             finally:
-                if not self.connected:
-                    self.socketio_connected = False
-                    self.authenticated = False
+                await self.stop()
 
-            if not reconnect:
-                return
+            return
 
-            print(
-                "[PO] Повторное подключение через "
-                f"{delay} сек."
-            )
+        await self.start()
 
-            await asyncio.sleep(delay)
-
-            delay = min(
-                delay * 2,
-                self.RECONNECT_MAX,
-            )
+        try:
+            while not self._stop_event.is_set():
+                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            await self.stop()
 
 
 async def main() -> None:
