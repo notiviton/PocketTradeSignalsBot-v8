@@ -5,6 +5,7 @@ Pocket Option WebSocket client.
     Pocket Option WebSocket / Socket.IO.
 
 Автоматическая торговля отсутствует.
+
 Клиент используется только для получения:
     - ticks
     - history
@@ -60,19 +61,21 @@ class PocketOptionWebSocketClient:
     """
     Клиент Pocket Option WebSocket.
 
-    Engine.IO:
-        0 -> OPEN
-        40 -> Socket.IO CONNECT
-        42 -> Socket.IO EVENT
+    Подтверждённый браузерный порядок:
 
-    Авторизация:
-        42["auth", {
-            "sessionToken": "...",
-            "uid": "2249701",
-            "lang": "ru",
-            "currentUrl": "cabinet/quick-high-low/USD",
-            "isChart": 1
+        0{...}
+        40
+        40{"sid":"..."}
+        42["auth",{
+            "sessionToken":"...",
+            "uid":"2249701",
+            "lang":"ru",
+            "currentUrl":"cabinet",
+            "isChart":1
         }]
+        42["auth/success"]
+
+    Автоматическая торговля отсутствует.
     """
 
     DEFAULT_WS_URL = (
@@ -82,8 +85,8 @@ class PocketOptionWebSocketClient:
 
     DEFAULT_LANG = "ru"
 
-    # Подтверждено успешным браузерным подключением.
-    DEFAULT_CURRENT_URL = "cabinet/quick-high-low/USD"
+    # Подтверждено рабочим браузерным WebSocket.
+    DEFAULT_CURRENT_URL = "cabinet"
 
     PING_INTERVAL = 25
     PING_TIMEOUT = 20
@@ -107,13 +110,19 @@ class PocketOptionWebSocketClient:
         self.ssid = (
             ssid
             if ssid is not None
-            else os.getenv("POCKET_OPTION_SSID", "")
+            else os.getenv(
+                "POCKET_OPTION_SSID",
+                "",
+            )
         )
 
         self.uid = (
             uid
             if uid is not None
-            else os.getenv("POCKET_OPTION_UID", "")
+            else os.getenv(
+                "POCKET_OPTION_UID",
+                "",
+            )
         )
 
         self.ws_url = (
@@ -143,7 +152,9 @@ class PocketOptionWebSocketClient:
             )
         )
 
-        env_is_chart = os.getenv("POCKET_OPTION_IS_CHART")
+        env_is_chart = os.getenv(
+            "POCKET_OPTION_IS_CHART"
+        )
 
         if env_is_chart is not None:
             self.is_chart = env_is_chart.lower() not in {
@@ -177,7 +188,10 @@ class PocketOptionWebSocketClient:
 
         self.auth_event = asyncio.Event()
 
-        self.ticks: dict[str, deque[tuple[float, float]]] = {}
+        self.ticks: dict[
+            str,
+            deque[tuple[float, float]],
+        ] = {}
 
         self.history: dict[
             tuple[str, int],
@@ -186,32 +200,34 @@ class PocketOptionWebSocketClient:
 
         self.assets: list[Any] = []
 
-        self.subscriptions: set[tuple[str, int]] = set()
+        self.subscriptions: set[
+            tuple[str, int]
+        ] = set()
 
         self._history_waiters: dict[
             tuple[str, int],
-            asyncio.Future[list[PocketOptionCandle]],
+            asyncio.Future[
+                list[PocketOptionCandle]
+            ],
         ] = {}
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    # ================================================================
+    # HELPERS
+    # ================================================================
 
     def _get_uid(self) -> str:
-        """
-        UID Pocket Option передаётся как строка.
-
-        Браузер:
-            "uid":"2249701"
-        """
-
+        """UID Pocket Option передаётся как строка."""
         return str(self.uid).strip()
 
     @staticmethod
-    def timeframe_to_seconds(timeframe: str) -> int:
+    def timeframe_to_seconds(
+        timeframe: str,
+    ) -> int:
         """Преобразует таймфрейм в секунды."""
 
-        normalized = str(timeframe).strip().lower()
+        normalized = str(
+            timeframe
+        ).strip().lower()
 
         mapping = {
             "1m": 60,
@@ -242,33 +258,46 @@ class PocketOptionWebSocketClient:
         )
 
     @staticmethod
-    def normalize_symbol(symbol: str) -> str:
+    def normalize_symbol(
+        symbol: str,
+    ) -> str:
         """Преобразует символ в формат Pocket Option."""
 
         value = str(symbol).strip()
 
         if not value:
-            raise ValueError("Symbol is empty")
+            raise ValueError(
+                "Symbol is empty"
+            )
 
         upper = value.upper()
 
         if upper.endswith(" OTC"):
-            base = upper[:-4].replace("/", "")
+            base = upper[:-4].replace(
+                "/",
+                "",
+            )
             return f"{base}_otc"
 
         if upper.endswith("_OTC"):
-            base = upper[:-4].replace("/", "")
+            base = upper[:-4].replace(
+                "/",
+                "",
+            )
             return f"{base}_otc"
 
         if upper.endswith("OTC"):
-            base = upper[:-3].replace("/", "")
+            base = upper[:-3].replace(
+                "/",
+                "",
+            )
             return f"{base}_otc"
 
         return value
 
-    # ------------------------------------------------------------------
-    # Connection
-    # ------------------------------------------------------------------
+    # ================================================================
+    # CONNECTION
+    # ================================================================
 
     async def connect(self) -> None:
         """Подключается к Pocket Option WebSocket."""
@@ -320,18 +349,13 @@ class PocketOptionWebSocketClient:
             )
 
             await self._wait_engine_open()
+
             await self._send_socketio_connect()
+
             await self._wait_socketio_connect()
 
             self.connected = True
 
-            # ВАЖНО:
-            # Reader запускается ДО AUTH.
-            #
-            # create_task() только планирует задачу.
-            # sleep(0) передаёт управление event loop,
-            # чтобы Reader реально успел начать работу
-            # до отправки AUTH.
             self.reader_task = asyncio.create_task(
                 self._reader_loop()
             )
@@ -341,15 +365,12 @@ class PocketOptionWebSocketClient:
             await self.send_auth()
 
         except Exception:
-            if self.session is not None:
-                await self.session.close()
-
-            self.session = None
-            self.ws = None
-
+            await self._cleanup_connection()
             raise
 
-    async def _wait_engine_open(self) -> None:
+    async def _wait_engine_open(
+        self,
+    ) -> None:
         """Ожидает Engine.IO OPEN."""
 
         if self.ws is None:
@@ -377,28 +398,38 @@ class PocketOptionWebSocketClient:
                 )
 
                 if data.startswith("0"):
-                    payload = data[1:]
-
                     try:
-                        info = json.loads(payload)
+                        info = json.loads(
+                            data[1:]
+                        )
                     except json.JSONDecodeError:
                         info = {}
 
-                    self.engine_sid = info.get("sid")
+                    self.engine_sid = info.get(
+                        "sid"
+                    )
 
-                    self.ping_interval = float(
-                        info.get(
-                            "pingInterval",
-                            self.PING_INTERVAL * 1000,
+                    self.ping_interval = (
+                        float(
+                            info.get(
+                                "pingInterval",
+                                self.PING_INTERVAL
+                                * 1000,
+                            )
                         )
-                    ) / 1000.0
+                        / 1000.0
+                    )
 
-                    self.ping_timeout = float(
-                        info.get(
-                            "pingTimeout",
-                            self.PING_TIMEOUT * 1000,
+                    self.ping_timeout = (
+                        float(
+                            info.get(
+                                "pingTimeout",
+                                self.PING_TIMEOUT
+                                * 1000,
+                            )
                         )
-                    ) / 1000.0
+                        / 1000.0
+                    )
 
                     print(
                         "[PO] Engine.IO SID: "
@@ -424,10 +455,13 @@ class PocketOptionWebSocketClient:
                 aiohttp.WSMsgType.ERROR,
             }:
                 raise PocketOptionWebSocketError(
-                    "WebSocket closed before Engine.IO OPEN"
+                    "WebSocket closed before "
+                    "Engine.IO OPEN"
                 )
 
-    async def _send_socketio_connect(self) -> None:
+    async def _send_socketio_connect(
+        self,
+    ) -> None:
         """Отправляет Socket.IO CONNECT."""
 
         if self.ws is None:
@@ -441,7 +475,9 @@ class PocketOptionWebSocketClient:
             "[PO] → 40"
         )
 
-    async def _wait_socketio_connect(self) -> None:
+    async def _wait_socketio_connect(
+        self,
+    ) -> None:
         """Ожидает Socket.IO CONNECT."""
 
         if self.ws is None:
@@ -476,17 +512,26 @@ class PocketOptionWebSocketClient:
 
                     if payload:
                         try:
-                            info = json.loads(payload)
+                            info = json.loads(
+                                payload
+                            )
 
-                            if isinstance(info, dict):
-                                self.socketio_sid = info.get(
-                                    "sid"
+                            if isinstance(
+                                info,
+                                dict,
+                            ):
+                                self.socketio_sid = (
+                                    info.get(
+                                        "sid"
+                                    )
                                 )
+
                         except json.JSONDecodeError:
                             pass
 
                     print(
-                        "[PO] Socket.IO CONNECT подтверждён"
+                        "[PO] Socket.IO CONNECT "
+                        "подтверждён"
                     )
 
                     return
@@ -502,15 +547,18 @@ class PocketOptionWebSocketClient:
                 aiohttp.WSMsgType.ERROR,
             }:
                 raise PocketOptionWebSocketError(
-                    "WebSocket closed before Socket.IO CONNECT"
+                    "WebSocket closed before "
+                    "Socket.IO CONNECT"
                 )
 
-    # ------------------------------------------------------------------
-    # Authentication
-    # ------------------------------------------------------------------
+    # ================================================================
+    # AUTHENTICATION
+    # ================================================================
 
-    async def send_auth(self) -> None:
-        """Отправляет AUTH точно в формате браузера."""
+    async def send_auth(
+        self,
+    ) -> None:
+        """Отправляет AUTH в формате браузера."""
 
         if self.ws is None:
             raise PocketOptionWebSocketError(
@@ -543,12 +591,17 @@ class PocketOptionWebSocketClient:
         elif token:
             debug_payload["sessionToken"] = "***"
         else:
-            debug_payload["sessionToken"] = "<empty>"
+            debug_payload["sessionToken"] = (
+                "<empty>"
+            )
 
         print(
             "[PO] AUTH DEBUG: "
             + json.dumps(
-                ["auth", debug_payload],
+                [
+                    "auth",
+                    debug_payload,
+                ],
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
@@ -562,24 +615,28 @@ class PocketOptionWebSocketClient:
         packet = (
             "42"
             + json.dumps(
-                ["auth", payload],
+                [
+                    "auth",
+                    payload,
+                ],
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
         )
 
         print(
-            f"[PO] AUTH PACKET LENGTH: {len(packet)}"
+            "[PO] AUTH PACKET LENGTH: "
+            f"{len(packet)}"
         )
 
         await self.ws.send_str(packet)
 
         print(
             "[PO] → AUTH "
-            f'(uid={payload["uid"]}, '
-            f'lang={payload["lang"]}, '
-            f'isChart={payload["isChart"]}, '
-            f'currentUrl={payload["currentUrl"]})'
+            f"(uid={payload['uid']}, "
+            f"lang={payload['lang']}, "
+            f"isChart={payload['isChart']}, "
+            f"currentUrl={payload['currentUrl']})"
         )
 
         print(
@@ -600,6 +657,7 @@ class PocketOptionWebSocketClient:
                 self.auth_event.wait(),
                 timeout=timeout,
             )
+
         except asyncio.TimeoutError as exc:
             raise PocketOptionWebSocketError(
                 "authentication timeout: "
@@ -612,11 +670,13 @@ class PocketOptionWebSocketClient:
                 or "Pocket Option authentication failed"
             )
 
-    # ------------------------------------------------------------------
-    # Reader
-    # ------------------------------------------------------------------
+    # ================================================================
+    # READER
+    # ================================================================
 
-    async def _reader_loop(self) -> None:
+    async def _reader_loop(
+        self,
+    ) -> None:
         """Основной цикл чтения WebSocket."""
 
         if self.ws is None:
@@ -714,8 +774,9 @@ class PocketOptionWebSocketClient:
             self.authenticated = False
 
             self.last_error = (
-                "Pocket Option Socket.IO DISCONNECT (41) "
-                "immediately after AUTH"
+                "Pocket Option Socket.IO "
+                "DISCONNECT (41) immediately "
+                "after AUTH"
             )
 
             self.auth_event.set()
@@ -736,7 +797,9 @@ class PocketOptionWebSocketClient:
                 data[2:]
             )
 
-    async def _send_engine_pong(self) -> None:
+    async def _send_engine_pong(
+        self,
+    ) -> None:
         """Отправляет Engine.IO pong."""
 
         if self.ws is None:
@@ -759,14 +822,21 @@ class PocketOptionWebSocketClient:
         """Обрабатывает Socket.IO event."""
 
         try:
-            event = json.loads(payload)
+            event = json.loads(
+                payload
+            )
+
         except json.JSONDecodeError:
             print(
-                "[PO] Некорректный Socket.IO JSON"
+                "[PO] Некорректный "
+                "Socket.IO JSON"
             )
             return
 
-        if not isinstance(event, list) or not event:
+        if not isinstance(
+            event,
+            list,
+        ) or not event:
             return
 
         event_name = event[0]
@@ -799,7 +869,7 @@ class PocketOptionWebSocketClient:
             self.authenticated = False
 
             self.last_error = (
-                f"Authentication failed: "
+                "Authentication failed: "
                 f"{event_data}"
             )
 
@@ -815,7 +885,10 @@ class PocketOptionWebSocketClient:
         if event_name == "updateAssets":
             self.assets = (
                 event_data
-                if isinstance(event_data, list)
+                if isinstance(
+                    event_data,
+                    list,
+                )
                 else []
             )
 
@@ -856,9 +929,9 @@ class PocketOptionWebSocketClient:
         }:
             return
 
-    # ------------------------------------------------------------------
-    # Tick handling
-    # ------------------------------------------------------------------
+    # ================================================================
+    # TICKS
+    # ================================================================
 
     async def _handle_update_stream(
         self,
@@ -868,7 +941,10 @@ class PocketOptionWebSocketClient:
 
         items = (
             data
-            if isinstance(data, list)
+            if isinstance(
+                data,
+                list,
+            )
             else [data]
         )
 
@@ -934,7 +1010,10 @@ class PocketOptionWebSocketClient:
 
             return
 
-        if isinstance(data, list) and len(data) >= 2:
+        if (
+            isinstance(data, list)
+            and len(data) >= 2
+        ):
             try:
                 symbol = data[0]
                 price = data[1]
@@ -984,15 +1063,16 @@ class PocketOptionWebSocketClient:
                     price,
                     timestamp,
                 )
+
             except Exception as exc:
                 print(
                     "[PO] Tick callback error: "
                     f"{exc}"
                 )
 
-    # ------------------------------------------------------------------
-    # Binary
-    # ------------------------------------------------------------------
+    # ================================================================
+    # BINARY
+    # ================================================================
 
     async def _handle_binary(
         self,
@@ -1008,9 +1088,9 @@ class PocketOptionWebSocketClient:
             f"preview={preview}"
         )
 
-    # ------------------------------------------------------------------
-    # Subscription
-    # ------------------------------------------------------------------
+    # ================================================================
+    # SUBSCRIPTION
+    # ================================================================
 
     async def subscribe(
         self,
@@ -1085,9 +1165,9 @@ class PocketOptionWebSocketClient:
             )
         )
 
-    # ------------------------------------------------------------------
-    # History
-    # ------------------------------------------------------------------
+    # ================================================================
+    # HISTORY
+    # ================================================================
 
     async def request_history(
         self,
@@ -1097,12 +1177,7 @@ class PocketOptionWebSocketClient:
         timeout: float = 20.0,
         offset: int | None = None,
     ) -> list[PocketOptionCandle]:
-        """
-        Запрашивает историю свечей.
-
-        Поддерживает count и offset для совместимости
-        с текущим ForexService.
-        """
+        """Запрашивает историю свечей."""
 
         await self.wait_authenticated(
             timeout=timeout
@@ -1132,11 +1207,16 @@ class PocketOptionWebSocketClient:
             period,
         )
 
-        old_waiter = self._history_waiters.get(
-            key
+        old_waiter = (
+            self._history_waiters.get(
+                key
+            )
         )
 
-        if old_waiter is not None and not old_waiter.done():
+        if (
+            old_waiter is not None
+            and not old_waiter.done()
+        ):
             old_waiter.cancel()
 
         loop = asyncio.get_running_loop()
@@ -1150,7 +1230,9 @@ class PocketOptionWebSocketClient:
         payload = {
             "asset": normalized,
             "index": 0,
-            "time": int(time.time()),
+            "time": int(
+                time.time()
+            ),
             "offset": count,
             "period": period,
         }
@@ -1177,7 +1259,9 @@ class PocketOptionWebSocketClient:
                 "WebSocket is not initialized"
             )
 
-        await self.ws.send_str(packet)
+        await self.ws.send_str(
+            packet
+        )
 
         print(
             "[PO] → loadHistoryPeriod "
@@ -1203,7 +1287,8 @@ class PocketOptionWebSocketClient:
             if cached:
                 print(
                     "[PO] History timeout, "
-                    f"используем cache: {len(cached)}"
+                    f"используем cache: "
+                    f"{len(cached)}"
                 )
 
                 return cached[-count:]
@@ -1215,8 +1300,10 @@ class PocketOptionWebSocketClient:
             )
 
         finally:
-            current = self._history_waiters.get(
-                key
+            current = (
+                self._history_waiters.get(
+                    key
+                )
             )
 
             if current is waiter:
@@ -1238,8 +1325,8 @@ class PocketOptionWebSocketClient:
 
         if not candles:
             print(
-                "[PO] History event без свечей: "
-                f"{event_name}"
+                "[PO] History event без "
+                f"свечей: {event_name}"
             )
             return
 
@@ -1265,7 +1352,9 @@ class PocketOptionWebSocketClient:
 
             if raw_period is not None:
                 try:
-                    period = int(raw_period)
+                    period = int(
+                        raw_period
+                    )
                 except (
                     TypeError,
                     ValueError,
@@ -1284,7 +1373,10 @@ class PocketOptionWebSocketClient:
                     symbol = candidate_symbol
                     break
 
-        if period is None and symbol is not None:
+        if (
+            period is None
+            and symbol is not None
+        ):
             candidates = [
                 p
                 for s, p in self.subscriptions
@@ -1294,10 +1386,14 @@ class PocketOptionWebSocketClient:
             if candidates:
                 period = candidates[-1]
 
-        if symbol is None or period is None:
+        if (
+            symbol is None
+            or period is None
+        ):
             print(
                 "[PO] History получена, "
-                "но symbol/period не определены"
+                "но symbol/period "
+                "не определены"
             )
             return
 
@@ -1317,11 +1413,16 @@ class PocketOptionWebSocketClient:
             f"candles={len(candles)}"
         )
 
-        waiter = self._history_waiters.get(
-            key
+        waiter = (
+            self._history_waiters.get(
+                key
+            )
         )
 
-        if waiter is not None and not waiter.done():
+        if (
+            waiter is not None
+            and not waiter.done()
+        ):
             waiter.set_result(
                 self.history[key]
             )
@@ -1347,13 +1448,21 @@ class PocketOptionWebSocketClient:
                     raw_items = data[key]
                     break
 
-        if isinstance(raw_items, dict):
+        if isinstance(
+            raw_items,
+            dict,
+        ):
             raw_items = [raw_items]
 
-        if not isinstance(raw_items, list):
+        if not isinstance(
+            raw_items,
+            list,
+        ):
             return []
 
-        result: list[PocketOptionCandle] = []
+        result: list[
+            PocketOptionCandle
+        ] = []
 
         for item in raw_items:
             candle = (
@@ -1362,10 +1471,13 @@ class PocketOptionWebSocketClient:
             )
 
             if candle is not None:
-                result.append(candle)
+                result.append(
+                    candle
+                )
 
         result.sort(
-            key=lambda candle: candle.timestamp
+            key=lambda candle:
+                candle.timestamp
         )
 
         return result
@@ -1379,15 +1491,28 @@ class PocketOptionWebSocketClient:
         if isinstance(item, dict):
             timestamp = (
                 item.get("timestamp")
-                if item.get("timestamp") is not None
+                if item.get(
+                    "timestamp"
+                ) is not None
                 else item.get("time")
             )
 
-            open_value = item.get("open")
-            high_value = item.get("high")
-            low_value = item.get("low")
-            close_value = item.get("close")
-            volume_value = item.get("volume", 0)
+            open_value = item.get(
+                "open"
+            )
+            high_value = item.get(
+                "high"
+            )
+            low_value = item.get(
+                "low"
+            )
+            close_value = item.get(
+                "close"
+            )
+            volume_value = item.get(
+                "volume",
+                0,
+            )
 
             if any(
                 value is None
@@ -1406,19 +1531,33 @@ class PocketOptionWebSocketClient:
                     timestamp=int(
                         float(timestamp)
                     ),
-                    open=float(open_value),
-                    high=float(high_value),
-                    low=float(low_value),
-                    close=float(close_value),
-                    volume=float(volume_value),
+                    open=float(
+                        open_value
+                    ),
+                    high=float(
+                        high_value
+                    ),
+                    low=float(
+                        low_value
+                    ),
+                    close=float(
+                        close_value
+                    ),
+                    volume=float(
+                        volume_value
+                    ),
                 )
+
             except (
                 TypeError,
                 ValueError,
             ):
                 return None
 
-        if isinstance(item, (list, tuple)):
+        if isinstance(
+            item,
+            (list, tuple),
+        ):
             if len(item) < 5:
                 return None
 
@@ -1437,6 +1576,7 @@ class PocketOptionWebSocketClient:
                         else 0.0
                     ),
                 )
+
             except (
                 TypeError,
                 ValueError,
@@ -1445,15 +1585,17 @@ class PocketOptionWebSocketClient:
 
         return None
 
-    # ------------------------------------------------------------------
-    # Public data access
-    # ------------------------------------------------------------------
+    # ================================================================
+    # PUBLIC DATA
+    # ================================================================
 
     def get_ticks(
         self,
         symbol: str,
         limit: int = 100,
-    ) -> list[tuple[float, float]]:
+    ) -> list[
+        tuple[float, float]
+    ]:
         """Возвращает последние ticks."""
 
         normalized = self.normalize_symbol(
@@ -1467,14 +1609,18 @@ class PocketOptionWebSocketClient:
             )
         )
 
-        return values[-int(limit):]
+        return values[
+            -int(limit):
+        ]
 
     def get_history(
         self,
         symbol: str,
         period: int = 60,
         limit: int = 500,
-    ) -> list[PocketOptionCandle]:
+    ) -> list[
+        PocketOptionCandle
+    ]:
         """Возвращает кэшированную историю."""
 
         normalized = self.normalize_symbol(
@@ -1489,24 +1635,33 @@ class PocketOptionWebSocketClient:
             [],
         )
 
-        return values[-int(limit):]
+        return values[
+            -int(limit):
+        ]
 
-    def get_assets(self) -> list[Any]:
+    def get_assets(
+        self,
+    ) -> list[Any]:
         """Возвращает список активов."""
-
         return list(self.assets)
 
-    # ------------------------------------------------------------------
-    # Status
-    # ------------------------------------------------------------------
+    # ================================================================
+    # STATUS
+    # ================================================================
 
-    def status(self) -> dict[str, Any]:
+    def status(
+        self,
+    ) -> dict[str, Any]:
         """Возвращает диагностический статус."""
 
         return {
             "connected": self.connected,
-            "socketio_connected": self.socketio_connected,
-            "authenticated": self.authenticated,
+            "socketio_connected": (
+                self.socketio_connected
+            ),
+            "authenticated": (
+                self.authenticated
+            ),
             "engine_sid": self.engine_sid,
             "socketio_sid": self.socketio_sid,
             "known_symbols": list(
@@ -1527,24 +1682,28 @@ class PocketOptionWebSocketClient:
             "last_error": self.last_error,
         }
 
-    # ------------------------------------------------------------------
-    # Start / stop
-    # ------------------------------------------------------------------
+    # ================================================================
+    # START / STOP
+    # ================================================================
 
-    async def start(self) -> None:
+    async def start(
+        self,
+    ) -> None:
         """Запускает WebSocket-клиент."""
-
         await self.connect()
 
-    async def stop(self) -> None:
-        """Останавливает WebSocket-клиент."""
-
-        print(
-            "[PO] Остановка WebSocket клиента..."
-        )
+    async def _cleanup_connection(
+        self,
+    ) -> None:
+        """Безопасно закрывает текущее соединение."""
 
         if self.reader_task is not None:
-            if not self.reader_task.done():
+            current = asyncio.current_task()
+
+            if (
+                self.reader_task is not current
+                and not self.reader_task.done()
+            ):
                 self.reader_task.cancel()
 
                 try:
@@ -1573,6 +1732,18 @@ class PocketOptionWebSocketClient:
         self.connected = False
         self.socketio_connected = False
         self.authenticated = False
+
+    async def stop(
+        self,
+    ) -> None:
+        """Останавливает WebSocket-клиент."""
+
+        print(
+            "[PO] Остановка WebSocket клиента..."
+        )
+
+        await self._cleanup_connection()
+
         self.auth_event.clear()
 
         print(
@@ -1602,7 +1773,9 @@ class PocketOptionWebSocketClient:
                 raise
 
             except Exception as exc:
-                self.last_error = str(exc)
+                self.last_error = str(
+                    exc
+                )
 
                 print(
                     "[PO] Ошибка WebSocket: "
