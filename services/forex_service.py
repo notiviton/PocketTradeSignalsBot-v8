@@ -9,24 +9,10 @@ from pocket_option.pocket_option.websocket_client import (
 )
 class ForexService:
     """
-    Единый сервис рыночных данных проекта.
+    Сервис получения рыночных данных.
     Источник данных:
         Pocket Option WebSocket
-    Цепочка:
-        Pocket Option WebSocket
-            ↓
-        History / realtime ticks
-            ↓
-        Candle aggregation
-            ↓
-        MarketData
-            ↓
-        IndicatorEngine
-    ВАЖНО:
-    - Twelve Data не используется;
-    - старый REST Pocket OTC provider не используется;
-    - торговых операций нет;
-    - сервис предназначен только для аналитики.
+    Автоматическое открытие сделок здесь отсутствует.
     """
     DEFAULT_SOURCE = "pocket_otc"
     DEFAULT_SYMBOL = "EUR/USD OTC"
@@ -34,453 +20,287 @@ class ForexService:
     DEFAULT_LIMIT = 500
     def __init__(
         self,
-        websocket_client: PocketOptionWebSocketClient | None = None,
+        client: PocketOptionWebSocketClient | None = None,
     ) -> None:
-        self.client = (
-            websocket_client
-            or PocketOptionWebSocketClient()
-        )
+        self.client = client or PocketOptionWebSocketClient()
         self._started = False
         self._start_lock = asyncio.Lock()
-    # ==========================================================================
-    # LIFECYCLE
-    # ==========================================================================
     async def start(self) -> None:
-        """
-        Запустить WebSocket background lifecycle.
-        """
+        """Запустить Pocket Option WebSocket."""
         async with self._start_lock:
             if self._started:
                 return
-            await self.client.start()
+            await self.client.connect()
             self._started = True
     async def stop(self) -> None:
-        """
-        Корректно остановить WebSocket.
-        """
+        """Остановить Pocket Option WebSocket."""
         async with self._start_lock:
             if not self._started:
                 return
-            await self.client.stop()
+            await self.client.close()
             self._started = False
     async def _ensure_started(self) -> None:
+        """Убедиться, что WebSocket запущен."""
         if not self._started:
             await self.start()
-    # ==========================================================================
-    # TIMEFRAME
-    # ==========================================================================
     @staticmethod
-    def _timeframe_to_seconds(
-        timeframe: str,
-    ) -> int:
+    def _timeframe_to_seconds(timeframe: str) -> int:
         """
-        Преобразовать пользовательский timeframe
-        в количество секунд.
-        Используется для Pocket Option WebSocket history API.
+        Преобразовать таймфрейм в секунды.
+        Поддерживаемые варианты:
+            1m, 5m, 15m, 30m, 1h, 4h, 1d
         """
-        normalized = (
-            str(timeframe)
-            .strip()
-            .lower()
-        )
+        value = str(timeframe).strip().lower()
         mapping = {
             "1m": 60,
-            "3m": 180,
             "5m": 300,
-            "10m": 600,
             "15m": 900,
             "30m": 1800,
             "1h": 3600,
-            "2h": 7200,
             "4h": 14400,
-            "6h": 21600,
-            "12h": 43200,
             "1d": 86400,
         }
-        try:
-            return mapping[normalized]
-        except KeyError as exc:
-            raise ValueError(
-                "Unsupported timeframe: "
-                f"{timeframe}. "
-                "Supported timeframes: "
-                f"{', '.join(mapping.keys())}"
-            ) from exc
-    # ==========================================================================
-    # MARKET DATA
-    # ==========================================================================
+        if value in mapping:
+            return mapping[value]
+        if value.endswith("m"):
+            try:
+                minutes = int(value[:-1])
+                if minutes > 0:
+                    return minutes * 60
+            except ValueError:
+                pass
+        if value.endswith("h"):
+            try:
+                hours = int(value[:-1])
+                if hours > 0:
+                    return hours * 3600
+            except ValueError:
+                pass
+        if value.endswith("d"):
+            try:
+                days = int(value[:-1])
+                if days > 0:
+                    return days * 86400
+            except ValueError:
+                pass
+        raise MarketDataError(
+            f"Неподдерживаемый таймфрейм: {timeframe}"
+        )
     async def get_market(
         self,
-        source: str = DEFAULT_SOURCE,
-        symbol: str = DEFAULT_SYMBOL,
-        timeframe: str = DEFAULT_TIMEFRAME,
+        symbol: str | None = None,
+        timeframe: str | None = None,
         limit: int = DEFAULT_LIMIT,
+        source: str = DEFAULT_SOURCE,
     ) -> MarketData:
         """
-        Получить MarketData для IndicatorEngine.
-        `source` оставлен только для совместимости со старым
-        интерфейсом. Фактически разрешён только Pocket Option.
+        Получить свечи рынка из Pocket Option.
+        Важно:
+        offset намеренно не передаётся в request_history().
+        Поэтому используется DEFAULT_HISTORY_OFFSET клиента
+        PocketOptionWebSocketClient, сейчас это 9000.
         """
-        normalized_source = (
-            source or self.DEFAULT_SOURCE
-        ).strip().lower()
-        if normalized_source not in {
-            self.DEFAULT_SOURCE,
-            "pocketoption",
-            "pocket_option",
-            "pocket",
-        }:
+        await self._ensure_started()
+        if source != self.DEFAULT_SOURCE:
             raise MarketDataError(
-                "Unsupported market data source: "
-                f"{normalized_source}. "
-                "Only Pocket Option is supported."
+                f"Источник {source!r} не поддерживается. "
+                "Используется только Pocket Option."
             )
-        if not symbol:
+        symbol = symbol or self.DEFAULT_SYMBOL
+        timeframe = timeframe or self.DEFAULT_TIMEFRAME
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
             raise MarketDataError(
-                "Market symbol is required."
-            )
-        if not timeframe:
-            raise MarketDataError(
-                "Market timeframe is required."
-            )
+                f"Некорректный limit: {limit!r}"
+            ) from exc
         if limit <= 0:
             raise MarketDataError(
-                "Market data limit must be greater than zero."
+                f"limit должен быть больше 0: {limit}"
             )
         try:
-            await self._ensure_started()
-            period = self._timeframe_to_seconds(
-                timeframe
+            period = self._timeframe_to_seconds(timeframe)
+            provider_symbol = self.client.normalize_symbol(symbol)
+            # ВАЖНО:
+            # offset здесь НЕ передаём.
+            #
+            # request_history() сам использует:
+            # PocketOptionWebSocketClient.DEFAULT_HISTORY_OFFSET = 9000
+            #
+            # Раньше здесь было:
+            # offset=max(int(limit), 100)
+            #
+            # При limit=500 это отправляло offset=500.
+            candles = await self.client.request_history(
+                provider_symbol,
+                period,
+                timeout=20.0,
             )
-            provider_symbol = (
-                self.client.normalize_symbol(
-                    symbol
-                )
-            )
-            candles = (
-                await self.client.request_history(
+            # Если WebSocket вернул меньше требуемого количества,
+            # дополнительно проверяем локальный cache.
+            if len(candles) < limit:
+                cached = self.client.get_cached_candles(
                     provider_symbol,
                     period,
-                    offset=max(
-                        int(limit),
-                        100,
-                    ),
-                    timeout=20.0,
                 )
-            )
-            if len(candles) < limit:
-                cached = (
-                    self.client.get_cached_candles(
-                        provider_symbol,
-                        period,
-                        limit=limit,
-                    )
-                )
-                if len(cached) > len(candles):
+                if cached and len(cached) > len(candles):
                     candles = cached
-            candles = candles[-limit:]
             if not candles:
                 raise MarketDataError(
-                    "Pocket Option returned no candle data "
-                    f"for {symbol} {timeframe}."
+                    f"Pocket Option не вернул свечи: "
+                    f"{provider_symbol}, period={period}"
                 )
-            converted = [
-                self._convert_candle(
-                    candle
-                )
+            # Берём последние limit свечей.
+            candles = candles[-limit:]
+            market_candles = [
+                self._convert_candle(candle)
                 for candle in candles
             ]
-            self._validate_market_candles(
-                converted
-            )
+            self._validate_market_candles(market_candles)
             return MarketData(
-                source=self.DEFAULT_SOURCE,
                 symbol=symbol,
                 timeframe=timeframe,
-                candles=converted,
+                candles=market_candles,
+                source=self.DEFAULT_SOURCE,
             )
         except MarketDataError:
             raise
         except PocketOptionWebSocketError as exc:
             raise MarketDataError(
-                f"Pocket Option WebSocket error: {exc}"
-            ) from exc
-        except ValueError as exc:
-            raise MarketDataError(
-                f"Invalid market parameters: {exc}"
+                f"Ошибка Pocket Option WebSocket: {exc}"
             ) from exc
         except Exception as exc:
             raise MarketDataError(
-                f"Pocket Option market data error: {exc}"
+                f"Ошибка получения рыночных данных: {exc}"
             ) from exc
-    # ==========================================================================
-    # LAST PRICE
-    # ==========================================================================
     async def get_last_prices(
         self,
-        symbol: str = DEFAULT_SYMBOL,
-        timeframe: str = DEFAULT_TIMEFRAME,
-        source: str = DEFAULT_SOURCE,
-    ) -> str:
+        symbol: str | None = None,
+        timeframe: str | None = None,
+    ) -> dict[str, Any]:
         """
-        Диагностический метод для /test_forex.
-        Возвращает понятный текст вместо старого Twelve Data response.
+        Получить последние данные по инструменту.
         """
-        normalized_source = (
-            source or self.DEFAULT_SOURCE
-        ).strip().lower()
-        if normalized_source not in {
-            self.DEFAULT_SOURCE,
-            "pocketoption",
-            "pocket_option",
-            "pocket",
-        }:
-            raise MarketDataError(
-                "Only Pocket Option is supported."
-            )
+        await self._ensure_started()
+        symbol = symbol or self.DEFAULT_SYMBOL
+        timeframe = timeframe or self.DEFAULT_TIMEFRAME
+        period = self._timeframe_to_seconds(timeframe)
+        provider_symbol = self.client.normalize_symbol(symbol)
         try:
-            await self._ensure_started()
-            period = self._timeframe_to_seconds(
-                timeframe
-            )
-            provider_symbol = (
-                self.client.normalize_symbol(
-                    symbol
-                )
-            )
             await self.client.subscribe(
                 provider_symbol,
                 period,
             )
-            # Даем realtime потоку короткое время
-            # получить актуальный tick.
-            last_tick = (
-                self.client.get_last_tick(
-                    provider_symbol
-                )
+            tick = await self.client.wait_for_tick(
+                provider_symbol,
+                timeout=10.0,
             )
-            if last_tick is None:
-                try:
-                    await asyncio.wait_for(
-                        self._wait_for_tick(
-                            provider_symbol
-                        ),
-                        timeout=10.0,
-                    )
-                except asyncio.TimeoutError:
-                    pass
-                last_tick = (
-                    self.client.get_last_tick(
-                        provider_symbol
-                    )
-                )
-            if last_tick is None:
+            if tick is None:
                 raise MarketDataError(
-                    "No realtime price received from "
-                    f"Pocket Option for {symbol}."
+                    f"Pocket Option не вернул последний тик: "
+                    f"{provider_symbol}"
                 )
-            return (
-                "Pocket Option WebSocket: ONLINE\n"
-                f"Instrument: {symbol}\n"
-                f"Provider symbol: {provider_symbol}\n"
-                f"Timeframe: {timeframe}\n"
-                f"Last price: {last_tick.price:.6f}\n"
-                f"Tick timestamp: {last_tick.timestamp:.3f}\n"
-                "Analytics only: YES\n"
-                "Trade execution: DISABLED"
-            )
+            return {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "timestamp": tick[0],
+                "price": tick[1],
+            }
         except MarketDataError:
             raise
         except PocketOptionWebSocketError as exc:
             raise MarketDataError(
-                f"Pocket Option WebSocket error: {exc}"
+                f"Ошибка Pocket Option WebSocket: {exc}"
             ) from exc
         except Exception as exc:
             raise MarketDataError(
-                f"Pocket Option price error: {exc}"
+                f"Ошибка получения последней цены: {exc}"
             ) from exc
-    async def _wait_for_tick(
-        self,
-        symbol: str,
-    ) -> None:
-        """
-        Небольшой polling без создания второго WebSocket reader.
-        """
-        provider_symbol = (
-            self.client.normalize_symbol(
-                symbol
-            )
-        )
-        while True:
-            if (
-                self.client.get_last_tick(
-                    provider_symbol
-                )
-                is not None
-            ):
-                return
-            await asyncio.sleep(0.25)
-    # ==========================================================================
-    # STATUS
-    # ==========================================================================
     def status(self) -> dict[str, Any]:
-        """
-        Состояние источника рыночных данных.
-        """
-        client_status = self.client.status()
-        return {
-            "source": self.DEFAULT_SOURCE,
-            "started": self._started,
-            "connected": client_status.get(
-                "connected",
-                False,
-            ),
-            "authenticated": client_status.get(
-                "authenticated",
-                False,
-            ),
-            "analytics_only": True,
-            "trade_execution": False,
-            "last_error": client_status.get(
-                "last_error"
-            ),
-            "known_symbols": client_status.get(
-                "known_symbols",
-                [],
-            ),
-            "subscriptions": client_status.get(
-                "subscriptions",
-                {},
-            ),
-        }
-    # ==========================================================================
-    # CONVERSION
-    # ==========================================================================
+        """Вернуть диагностический статус WebSocket."""
+        try:
+            return self.client.status()
+        except Exception as exc:
+            return {
+                "started": self._started,
+                "error": str(exc),
+            }
     @staticmethod
     def _convert_candle(
         candle: PocketOptionCandle,
     ) -> Candle:
+        """Преобразовать свечу Pocket Option в Candle."""
         return Candle(
-            timestamp=int(
-                candle.timestamp
-            ),
-            open=float(
-                candle.open
-            ),
-            high=float(
-                candle.high
-            ),
-            low=float(
-                candle.low
-            ),
-            close=float(
-                candle.close
-            ),
-            volume=float(
-                candle.volume
-            ),
+            timestamp=int(candle.timestamp),
+            open=float(candle.open),
+            high=float(candle.high),
+            low=float(candle.low),
+            close=float(candle.close),
+            volume=float(candle.volume),
         )
-    # ==========================================================================
-    # VALIDATION
-    # ==========================================================================
     @staticmethod
     def _validate_market_candles(
         candles: list[Candle],
     ) -> None:
+        """Проверить корректность последовательности свечей."""
         if not candles:
             raise MarketDataError(
-                "No candles available."
+                "Получен пустой список свечей."
             )
-        previous_timestamp = 0
-        for candle in candles:
-            if candle.timestamp <= 0:
-                raise MarketDataError(
-                    "Invalid candle timestamp."
-                )
+        previous_timestamp: int | None = None
+        for index, candle in enumerate(candles):
             if candle.open <= 0:
                 raise MarketDataError(
-                    "Invalid candle open price."
+                    f"Некорректный open у свечи #{index}: "
+                    f"{candle.open}"
                 )
             if candle.high <= 0:
                 raise MarketDataError(
-                    "Invalid candle high price."
+                    f"Некорректный high у свечи #{index}: "
+                    f"{candle.high}"
                 )
             if candle.low <= 0:
                 raise MarketDataError(
-                    "Invalid candle low price."
+                    f"Некорректный low у свечи #{index}: "
+                    f"{candle.low}"
                 )
             if candle.close <= 0:
                 raise MarketDataError(
-                    "Invalid candle close price."
+                    f"Некорректный close у свечи #{index}: "
+                    f"{candle.close}"
                 )
             if candle.high < candle.low:
                 raise MarketDataError(
-                    "Candle high is lower than low."
+                    f"high < low у свечи #{index}: "
+                    f"{candle.high} < {candle.low}"
                 )
             if candle.volume < 0:
                 raise MarketDataError(
-                    "Invalid candle volume."
+                    f"Некорректный volume у свечи #{index}: "
+                    f"{candle.volume}"
                 )
-            if (
-                previous_timestamp > 0
-                and candle.timestamp
-                <= previous_timestamp
-            ):
-                raise MarketDataError(
-                    "Candle timestamps are not "
-                    "strictly increasing."
-                )
-            previous_timestamp = (
-                candle.timestamp
+            if previous_timestamp is not None:
+                if candle.timestamp <= previous_timestamp:
+                    raise MarketDataError(
+                        "Временные метки свечей должны "
+                        "строго возрастать: "
+                        f"{previous_timestamp} -> "
+                        f"{candle.timestamp}"
+                    )
+            previous_timestamp = candle.timestamp
+    async def main(self) -> None:
+        """Простой self-check сервиса."""
+        await self.start()
+        try:
+            market = await self.get_market(
+                symbol=self.DEFAULT_SYMBOL,
+                timeframe=self.DEFAULT_TIMEFRAME,
+                limit=100,
             )
-# ==============================================================================
-# MODULE SELF-CHECK
-# ==============================================================================
-async def main() -> None:
-    """
-    Локальная проверка сервиса.
-    Торговых операций здесь нет.
-    """
-    service = ForexService()
-    try:
-        await service.start()
-        print(
-            "SERVICE STATUS:"
-        )
-        print(
-            service.status()
-        )
-        market = await service.get_market(
-            symbol="EUR/USD OTC",
-            timeframe="1m",
-            limit=100,
-        )
-        print(
-            f"Market source: {market.source}"
-        )
-        print(
-            f"Symbol: {market.symbol}"
-        )
-        print(
-            f"Timeframe: {market.timeframe}"
-        )
-        print(
-            f"Candles: {len(market.candles)}"
-        )
-        if market.candles:
-            candle = market.candles[-1]
             print(
-                "Last candle:",
-                {
-                    "timestamp": candle.timestamp,
-                    "open": candle.open,
-                    "high": candle.high,
-                    "low": candle.low,
-                    "close": candle.close,
-                    "volume": candle.volume,
-                },
+                f"Получено свечей: {len(market.candles)}"
             )
-    finally:
-        await service.stop()
+        finally:
+            await self.stop()
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(ForexService().main())
