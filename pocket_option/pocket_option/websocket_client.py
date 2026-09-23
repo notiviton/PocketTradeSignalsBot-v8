@@ -100,12 +100,8 @@ class PocketOptionWebSocketClient:
     MAX_TICKS = 5000
     MAX_HISTORY = 5000
 
-    # Pocket Option может нормально отвечать на history
-    # только при достаточно большом offset.
     DEFAULT_HISTORY_OFFSET = 9000
 
-    # Максимум Socket.IO binary attachments,
-    # которые держим одновременно.
     MAX_BINARY_ATTACHMENTS = 10
 
     def __init__(
@@ -288,11 +284,26 @@ class PocketOptionWebSocketClient:
             tuple[str, int]
         ] = set()
 
-        self._history_waiters: dict[
-            tuple[str, int],
+        # ============================================================
+        # HISTORY REQUEST CORRELATION
+        #
+        # ВАЖНО:
+        # Каждый loadHistoryPeriod получает уникальный index.
+        # Ответ history сопоставляется с waiter именно по index.
+        # ============================================================
+
+        self._history_request_index = 0
+
+        self._history_waiters_by_index: dict[
+            int,
             asyncio.Future[
                 list[PocketOptionCandle]
             ],
+        ] = {}
+
+        self._history_request_meta: dict[
+            int,
+            tuple[str, int],
         ] = {}
 
     # ================================================================
@@ -341,6 +352,21 @@ class PocketOptionWebSocketClient:
             time.time()
             + self.server_time_offset
         )
+
+    def _next_history_index(self) -> int:
+        """
+        Генерирует уникальный index для history-запроса.
+
+        Pocket Option использует index для сопоставления
+        loadHistoryPeriod с LoadHistoryPeriodResult.
+        """
+
+        self._history_request_index += 1
+
+        if self._history_request_index >= 2**63:
+            self._history_request_index = 1
+
+        return self._history_request_index
 
     @staticmethod
     def timeframe_to_seconds(
@@ -417,6 +443,29 @@ class PocketOptionWebSocketClient:
             return f"{base}_otc"
 
         return value
+
+    @staticmethod
+    def _normalize_timestamp(
+        value: Any,
+    ) -> int | None:
+        """Нормализует timestamp секунд/миллисекунд."""
+
+        try:
+            timestamp = float(value)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+        if timestamp <= 0:
+            return None
+
+        # Миллисекунды.
+        if timestamp > 100_000_000_000:
+            timestamp /= 1000.0
+
+        return int(timestamp)
 
     # ================================================================
     # SERVER TIME
@@ -1266,6 +1315,38 @@ class PocketOptionWebSocketClient:
             )
             return
 
+        # ============================================================
+        # RAW JSON
+        #
+        # ВАЖНО:
+        # HistoryResult может приходить не как 42[...],
+        # а как обычный JSON объект.
+        # ============================================================
+
+        try:
+            raw = json.loads(data)
+        except json.JSONDecodeError:
+            return
+
+        if isinstance(raw, dict):
+            if (
+                "index" in raw
+                and (
+                    "data" in raw
+                    or "candles" in raw
+                    or "history" in raw
+                    or "result" in raw
+                )
+            ):
+                print(
+                    "[PO] ← RAW HISTORY RESULT"
+                )
+
+                await self._handle_history_result(
+                    raw,
+                    event_name="raw-json",
+                )
+
     async def _send_engine_pong(
         self,
     ) -> None:
@@ -1543,7 +1624,63 @@ class PocketOptionWebSocketClient:
             f"preview={preview}"
         )
 
+        # ============================================================
+        # RAW BINARY JSON
+        #
+        # В рабочей реализации history result может приходить
+        # напрямую бинарным JSON без предварительного 451-header.
+        # Раньше такой пакет просто терялся.
+        # ============================================================
+
         if self._binary_event is None:
+            try:
+                decoded = data.decode(
+                    "utf-8"
+                ).strip()
+
+                if decoded.startswith(
+                    "42"
+                ):
+                    await self._handle_socketio_event(
+                        decoded[2:]
+                    )
+                    return
+
+                raw = json.loads(
+                    decoded
+                )
+
+                if isinstance(
+                    raw,
+                    dict,
+                ):
+                    if (
+                        "index" in raw
+                        and (
+                            "data" in raw
+                            or "candles" in raw
+                            or "history" in raw
+                            or "result" in raw
+                        )
+                    ):
+                        print(
+                            "[PO] ← RAW BINARY "
+                            "HISTORY RESULT"
+                        )
+
+                        await self._handle_history_result(
+                            raw,
+                            event_name="raw-binary-json",
+                        )
+
+                        return
+
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+            ):
+                pass
+
             return
 
         attachments = int(
@@ -1972,13 +2109,13 @@ class PocketOptionWebSocketClient:
         offset: int | None = None,
     ) -> list[PocketOptionCandle]:
         """
-        Запрашивает историю свечей.
+        Запрашивает историю.
 
         count:
             Сколько свечей нужно вернуть вызывающему коду.
 
         offset:
-            Сколько свечей просить у сервера.
+            Сколько данных просить у сервера.
 
         Если offset не задан, используется
         DEFAULT_HISTORY_OFFSET.
@@ -2016,24 +2153,12 @@ class PocketOptionWebSocketClient:
         )
 
         # ============================================================
-        # ВАЖНО:
-        # Создаём waiter ДО subscribe().
-        #
-        # Это исключает ситуацию, когда history/event
-        # придёт между subscribe() и созданием waiter.
+        # УНИКАЛЬНЫЙ REQUEST INDEX
         # ============================================================
 
-        old_waiter = (
-            self._history_waiters.get(
-                key
-            )
+        request_index = (
+            self._next_history_index()
         )
-
-        if (
-            old_waiter is not None
-            and not old_waiter.done()
-        ):
-            old_waiter.cancel()
 
         loop = asyncio.get_running_loop()
 
@@ -2041,7 +2166,16 @@ class PocketOptionWebSocketClient:
             list[PocketOptionCandle]
         ] = loop.create_future()
 
-        self._history_waiters[key] = waiter
+        self._history_waiters_by_index[
+            request_index
+        ] = waiter
+
+        self._history_request_meta[
+            request_index
+        ] = (
+            normalized,
+            period,
+        )
 
         try:
             # ========================================================
@@ -2055,9 +2189,6 @@ class PocketOptionWebSocketClient:
 
             # ========================================================
             # ДИАГНОСТИЧЕСКАЯ ПАУЗА
-            #
-            # Даём серверу 1 секунду после changeSymbol + subfor
-            # перед отправкой loadHistoryPeriod.
             # ========================================================
 
             await asyncio.sleep(1.0)
@@ -2073,7 +2204,7 @@ class PocketOptionWebSocketClient:
 
             payload = {
                 "asset": normalized,
-                "index": 0,
+                "index": request_index,
                 "time": self._server_timestamp(),
                 "offset": history_offset,
                 "period": period,
@@ -2131,6 +2262,11 @@ class PocketOptionWebSocketClient:
             )
 
             print(
+                "[PO]   request_index="
+                f"{request_index}"
+            )
+
+            print(
                 "[PO]   waiter=READY"
             )
 
@@ -2138,15 +2274,9 @@ class PocketOptionWebSocketClient:
                 "[PO] → loadHistoryPeriod "
                 f"asset={normalized} "
                 f"period={period} "
-                f"offset={history_offset}"
+                f"offset={history_offset} "
+                f"index={request_index}"
             )
-
-            # ========================================================
-            # ТОЧНЫЙ WIRE-ПАКЕТ
-            #
-            # В этом пакете нет SSID и других секретов.
-            # Он нужен для сравнения с реально работающим клиентом.
-            # ========================================================
 
             print(
                 "[PO] HISTORY WIRE PACKET:"
@@ -2184,7 +2314,8 @@ class PocketOptionWebSocketClient:
 
             print(
                 "[PO] History response получен: "
-                f"{len(result)} candles"
+                f"{len(result)} candles "
+                f"index={request_index}"
             )
 
             return result[
@@ -2222,6 +2353,11 @@ class PocketOptionWebSocketClient:
             )
 
             print(
+                "[PO]   request_index="
+                f"{request_index}"
+            )
+
+            print(
                 "[PO]   cached="
                 f"{len(cached)}"
             )
@@ -2240,35 +2376,105 @@ class PocketOptionWebSocketClient:
                 "History timeout: "
                 f"{normalized} "
                 f"period={period} "
-                f"offset={history_offset}"
+                f"offset={history_offset} "
+                f"index={request_index}"
             )
 
         except Exception:
             raise
 
         finally:
-            current = (
-                self._history_waiters.get(
-                    key
-                )
+            self._history_waiters_by_index.pop(
+                request_index,
+                None
             )
 
-            if current is waiter:
-                self._history_waiters.pop(
-                    key,
-                    None
-                )
+            self._history_request_meta.pop(
+                request_index,
+                None
+            )
 
     async def _handle_history_event(
         self,
         event_name: str,
         data: Any,
     ) -> None:
-        """Обрабатывает историю свечей."""
+        """
+        Обрабатывает history event.
 
+        Основная корреляция выполняется по index.
+        Если index отсутствует, используется осторожный
+        fallback по symbol/period.
+        """
+
+        if not isinstance(
+            data,
+            (dict, list),
+        ):
+            print(
+                "[PO] History event без "
+                f"поддерживаемого data: {event_name}"
+            )
+            return
+
+        if isinstance(
+            data,
+            dict,
+        ):
+            if "index" in data:
+                await self._handle_history_result(
+                    data,
+                    event_name=event_name,
+                )
+                return
+
+            # Иногда результат может быть вложен.
+            for nested_key in (
+                "result",
+                "data",
+            ):
+                nested = data.get(
+                    nested_key
+                )
+
+                if (
+                    isinstance(
+                        nested,
+                        dict,
+                    )
+                    and "index" in nested
+                ):
+                    await self._handle_history_result(
+                        nested,
+                        event_name=event_name,
+                    )
+                    return
+
+        # Старый / fallback-путь.
         candles = self._extract_candles(
-            data
+            data,
+            period=self._infer_period_from_data(
+                data
+            ),
         )
+
+        if not candles:
+            # Возможно, это ticks.
+            raw_items = self._extract_history_items(
+                data
+            )
+
+            period = self._infer_period_from_data(
+                data
+            )
+
+            if raw_items and period is not None:
+                candles = (
+                    self._build_candles_from_history_items(
+                        raw_items,
+                        period,
+                    )
+                )
 
         if not candles:
             print(
@@ -2296,10 +2502,331 @@ class PocketOptionWebSocketClient:
 
             return
 
-        symbol: str | None = None
-        period: int | None = None
+        symbol, period = (
+            self._infer_symbol_period(
+                data
+            )
+        )
 
-        if isinstance(data, dict):
+        if (
+            symbol is None
+            or period is None
+        ):
+            print(
+                "[PO] History получена, "
+                "но symbol/period "
+                "не определены"
+            )
+
+            print(
+                "[PO] event="
+                f"{event_name}"
+            )
+
+            return
+
+        key = (
+            symbol,
+            period,
+        )
+
+        self.history[key] = (
+            candles[
+                -self.MAX_HISTORY:
+            ]
+        )
+
+        print(
+            "[PO] History сохранена: "
+            f"{symbol} "
+            f"period={period} "
+            f"candles={len(candles)} "
+            f"event={event_name}"
+        )
+
+        self._resolve_legacy_history_waiter(
+            symbol,
+            period,
+            self.history[key],
+        )
+
+    async def _handle_history_result(
+        self,
+        result: dict[str, Any],
+        event_name: str,
+    ) -> None:
+        """
+        Обрабатывает LoadHistoryPeriodResult.
+
+        Поддерживаются:
+            - OHLC candles
+            - raw ticks {time, price}
+            - вложенный result/data
+        """
+
+        raw_index = result.get(
+            "index"
+        )
+
+        try:
+            request_index = int(
+                raw_index
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            request_index = None
+
+        meta = (
+            self._history_request_meta.get(
+                request_index
+            )
+            if request_index is not None
+            else None
+        )
+
+        if meta is None:
+            print(
+                "[PO] HISTORY RESULT "
+                "с неизвестным index: "
+                f"{raw_index}"
+            )
+
+        meta_symbol: str | None = None
+        meta_period: int | None = None
+
+        if meta is not None:
+            meta_symbol, meta_period = meta
+
+        symbol, period = (
+            self._infer_symbol_period(
+                result,
+                fallback_symbol=meta_symbol,
+                fallback_period=meta_period,
+            )
+        )
+
+        if symbol is None:
+            symbol = meta_symbol
+
+        if period is None:
+            period = meta_period
+
+        if period is None:
+            period = 60
+
+        raw_items = self._extract_history_items(
+            result
+        )
+
+        candles: list[
+            PocketOptionCandle
+        ] = []
+
+        if raw_items:
+            candles = (
+                self._build_candles_from_history_items(
+                    raw_items,
+                    period,
+                )
+            )
+
+        if not candles:
+            candles = self._extract_candles(
+                result,
+                period=period,
+            )
+
+        if not candles:
+            print(
+                "[PO] HISTORY RESULT "
+                "получен, но data не распознаны:"
+            )
+
+            print(
+                "[PO]   index="
+                f"{raw_index}"
+            )
+
+            print(
+                "[PO]   event="
+                f"{event_name}"
+            )
+
+            print(
+                "[PO]   keys="
+                f"{list(result.keys())[:50]}"
+            )
+
+            return
+
+        if symbol is None:
+            print(
+                "[PO] HISTORY RESULT: "
+                "symbol не определён"
+            )
+            return
+
+        key = (
+            symbol,
+            period,
+        )
+
+        candles = self._merge_history_with_recent_ticks(
+            symbol,
+            period,
+            candles,
+        )
+
+        candles = candles[
+            -self.MAX_HISTORY:
+        ]
+
+        self.history[key] = candles
+
+        print(
+            "[PO] HISTORY RESULT OK:"
+        )
+
+        print(
+            "[PO]   event="
+            f"{event_name}"
+        )
+
+        print(
+            "[PO]   index="
+            f"{raw_index}"
+        )
+
+        print(
+            "[PO]   asset="
+            f"{symbol}"
+        )
+
+        print(
+            "[PO]   period="
+            f"{period}"
+        )
+
+        print(
+            "[PO]   raw_items="
+            f"{len(raw_items)}"
+        )
+
+        print(
+            "[PO]   candles="
+            f"{len(candles)}"
+        )
+
+        if request_index is not None:
+            waiter = (
+                self._history_waiters_by_index.get(
+                    request_index
+                )
+            )
+
+            if (
+                waiter is not None
+                and not waiter.done()
+            ):
+                waiter.set_result(
+                    candles
+                )
+
+                print(
+                    "[PO] HISTORY WAITER "
+                    "RESOLVED:"
+                    f" index={request_index}"
+                )
+
+        else:
+            self._resolve_legacy_history_waiter(
+                symbol,
+                period,
+                candles,
+            )
+
+    def _extract_history_items(
+        self,
+        data: Any,
+    ) -> list[Any]:
+        """Извлекает массив history data."""
+
+        if isinstance(
+            data,
+            dict,
+        ):
+            # Основной формат:
+            # {"index": ..., "data": [...]}
+            for key in (
+                "data",
+                "candles",
+                "history",
+                "items",
+                "values",
+            ):
+                candidate = data.get(
+                    key
+                )
+
+                if isinstance(
+                    candidate,
+                    list,
+                ):
+                    return candidate
+
+            nested_result = data.get(
+                "result"
+            )
+
+            if isinstance(
+                nested_result,
+                dict,
+            ):
+                nested_items = (
+                    self._extract_history_items(
+                        nested_result
+                    )
+                )
+
+                if nested_items:
+                    return nested_items
+
+            if isinstance(
+                nested_result,
+                list,
+            ):
+                return nested_result
+
+            return []
+
+        if isinstance(
+            data,
+            list,
+        ):
+            return data
+
+        return []
+
+    def _infer_symbol_period(
+        self,
+        data: Any,
+        fallback_symbol: str | None = None,
+        fallback_period: int | None = None,
+    ) -> tuple[
+        str | None,
+        int | None,
+    ]:
+        """Определяет asset и period."""
+
+        symbol: str | None = None
+        period: int | None = fallback_period
+
+        if isinstance(
+            data,
+            dict,
+        ):
             raw_symbol = (
                 data.get("asset")
                 or data.get("symbol")
@@ -2328,90 +2855,469 @@ class PocketOptionWebSocketClient:
                     TypeError,
                     ValueError,
                 ):
-                    period = None
+                    pass
+
+            if symbol is None:
+                nested_result = data.get(
+                    "result"
+                )
+
+                if isinstance(
+                    nested_result,
+                    dict,
+                ):
+                    nested_symbol, nested_period = (
+                        self._infer_symbol_period(
+                            nested_result,
+                            fallback_symbol=fallback_symbol,
+                            fallback_period=period,
+                        )
+                    )
+
+                    if nested_symbol is not None:
+                        symbol = nested_symbol
+
+                    if nested_period is not None:
+                        period = nested_period
 
         if symbol is None:
-            for (
-                candidate_symbol,
-                candidate_period,
-            ) in self.subscriptions:
-                if (
-                    period is None
-                    or candidate_period == period
-                ):
-                    symbol = candidate_symbol
-                    break
+            symbol = fallback_symbol
+
+        if symbol is None:
+            # Используем активную подписку как fallback.
+            candidates = list(
+                self.subscriptions
+            )
+
+            if candidates:
+                if period is not None:
+                    for (
+                        candidate_symbol,
+                        candidate_period,
+                    ) in candidates:
+                        if (
+                            candidate_period
+                            == period
+                        ):
+                            symbol = candidate_symbol
+                            break
+
+                if symbol is None:
+                    symbol = candidates[-1][0]
 
         if (
             period is None
             and symbol is not None
         ):
             candidates = [
-                p
-                for s, p in self.subscriptions
-                if s == symbol
+                candidate_period
+                for (
+                    candidate_symbol,
+                    candidate_period,
+                ) in self.subscriptions
+                if candidate_symbol == symbol
             ]
 
             if candidates:
                 period = candidates[-1]
 
-        if (
-            symbol is None
-            or period is None
-        ):
-            print(
-                "[PO] History получена, "
-                "но symbol/period "
-                "не определены"
-            )
-
-            print(
-                "[PO] event="
-                f"{event_name}"
-            )
-
-            return
-
-        key = (
+        return (
             symbol,
             period,
         )
 
-        self.history[key] = candles[
-            -self.MAX_HISTORY:
-        ]
+    def _infer_period_from_data(
+        self,
+        data: Any,
+    ) -> int | None:
+        """Определяет period без определения symbol."""
 
-        print(
-            "[PO] History сохранена: "
-            f"{symbol} "
-            f"period={period} "
-            f"candles={len(candles)} "
-            f"event={event_name}"
-        )
-
-        waiter = (
-            self._history_waiters.get(
-                key
-            )
-        )
-
-        if (
-            waiter is not None
-            and not waiter.done()
+        if isinstance(
+            data,
+            dict,
         ):
-            waiter.set_result(
-                self.history[key]
+            raw_period = (
+                data.get("period")
+                or data.get("timeframe")
             )
+
+            if raw_period is not None:
+                try:
+                    return int(
+                        raw_period
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    pass
+
+        for (
+            _symbol,
+            candidate_period,
+        ) in self.subscriptions:
+            return candidate_period
+
+        return None
+
+    def _build_candles_from_history_items(
+        self,
+        items: list[Any],
+        period: int,
+    ) -> list[PocketOptionCandle]:
+        """
+        Преобразует history data в свечи.
+
+        Если сервер прислал OHLC:
+            OHLC сохраняются как свечи.
+
+        Если сервер прислал ticks:
+            ticks группируются по period.
+        """
+
+        if not items:
+            return []
+
+        ohlc_candles: list[
+            PocketOptionCandle
+        ] = []
+
+        tick_items: list[
+            tuple[int, float]
+        ] = []
+
+        for item in items:
+            candle = self._parse_candle(
+                item
+            )
+
+            if candle is not None:
+                ohlc_candles.append(
+                    candle
+                )
+                continue
+
+            tick = self._parse_history_tick(
+                item
+            )
+
+            if tick is not None:
+                tick_items.append(
+                    tick
+                )
+
+        # Если есть полноценные OHLC,
+        # используем их.
+        if ohlc_candles:
+            ohlc_candles.sort(
+                key=lambda candle:
+                    candle.timestamp
+            )
+
+            unique: dict[
+                int,
+                PocketOptionCandle,
+            ] = {}
+
+            for candle in ohlc_candles:
+                unique[
+                    candle.timestamp
+                ] = candle
+
+            return list(
+                sorted(
+                    unique.values(),
+                    key=lambda candle:
+                        candle.timestamp,
+                )
+            )
+
+        if not tick_items:
+            return []
+
+        return self._compile_ticks_to_candles(
+            tick_items,
+            period,
+        )
+
+    @staticmethod
+    def _parse_history_tick(
+        item: Any,
+    ) -> tuple[int, float] | None:
+        """Преобразует history item в (timestamp, price)."""
+
+        if isinstance(
+            item,
+            dict,
+        ):
+            timestamp = (
+                item.get("time")
+                if item.get("time") is not None
+                else item.get("timestamp")
+            )
+
+            price = (
+                item.get("price")
+                if item.get("price") is not None
+                else item.get("value")
+            )
+
+            if (
+                timestamp is None
+                or price is None
+            ):
+                return None
+
+            normalized_timestamp = (
+                PocketOptionWebSocketClient
+                ._normalize_timestamp(
+                    timestamp
+                )
+            )
+
+            if normalized_timestamp is None:
+                return None
+
+            try:
+                return (
+                    normalized_timestamp,
+                    float(price),
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                return None
+
+        if isinstance(
+            item,
+            (list, tuple),
+        ):
+            if len(item) < 2:
+                return None
+
+            # Формат [timestamp, price].
+            try:
+                first = float(
+                    item[0]
+                )
+                second = float(
+                    item[1]
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                return None
+
+            if first > 1_000_000_000:
+                timestamp = first
+                price = second
+            elif second > 1_000_000_000:
+                price = first
+                timestamp = second
+            else:
+                return None
+
+            normalized_timestamp = (
+                PocketOptionWebSocketClient
+                ._normalize_timestamp(
+                    timestamp
+                )
+            )
+
+            if normalized_timestamp is None:
+                return None
+
+            return (
+                normalized_timestamp,
+                price,
+            )
+
+        return None
+
+    @staticmethod
+    def _compile_ticks_to_candles(
+        ticks: list[
+            tuple[int, float]
+        ],
+        period: int,
+    ) -> list[PocketOptionCandle]:
+        """Собирает OHLC candles из ticks."""
+
+        if period <= 0:
+            return []
+
+        buckets: dict[
+            int,
+            list[tuple[int, float]],
+        ] = {}
+
+        for timestamp, price in ticks:
+            bucket = (
+                int(timestamp)
+                // period
+            ) * period
+
+            buckets.setdefault(
+                bucket,
+                [],
+            ).append(
+                (
+                    int(timestamp),
+                    float(price),
+                )
+            )
+
+        candles: list[
+            PocketOptionCandle
+        ] = []
+
+        for bucket_timestamp in sorted(
+            buckets
+        ):
+            values = sorted(
+                buckets[
+                    bucket_timestamp
+                ],
+                key=lambda item:
+                    item[0],
+            )
+
+            if not values:
+                continue
+
+            prices = [
+                price
+                for _timestamp, price
+                in values
+            ]
+
+            candles.append(
+                PocketOptionCandle(
+                    timestamp=bucket_timestamp,
+                    open=prices[0],
+                    high=max(prices),
+                    low=min(prices),
+                    close=prices[-1],
+                    volume=float(
+                        len(prices)
+                    ),
+                )
+            )
+
+        return candles
+
+    def _merge_history_with_recent_ticks(
+        self,
+        symbol: str,
+        period: int,
+        candles: list[PocketOptionCandle],
+    ) -> list[PocketOptionCandle]:
+        """
+        Добавляет recent ticks к истории.
+
+        Это позволяет не оставлять разрыв между history
+        и текущим live stream.
+        """
+
+        values = list(
+            self.ticks.get(
+                symbol,
+                [],
+            )
+        )
+
+        if not values:
+            return candles
+
+        history_last = (
+            candles[-1].timestamp
+            if candles
+            else 0
+        )
+
+        recent_ticks = []
+
+        for timestamp, price in values:
+            normalized_timestamp = (
+                self._normalize_timestamp(
+                    timestamp
+                )
+            )
+
+            if normalized_timestamp is None:
+                continue
+
+            if normalized_timestamp < history_last:
+                continue
+
+            recent_ticks.append(
+                (
+                    normalized_timestamp,
+                    float(price),
+                )
+            )
+
+        if not recent_ticks:
+            return candles
+
+        live_candles = (
+            self._compile_ticks_to_candles(
+                recent_ticks,
+                period,
+            )
+        )
+
+        if not live_candles:
+            return candles
+
+        merged: dict[
+            int,
+            PocketOptionCandle,
+        ] = {
+            candle.timestamp: candle
+            for candle in candles
+        }
+
+        for candle in live_candles:
+            existing = merged.get(
+                candle.timestamp
+            )
+
+            if existing is None:
+                merged[
+                    candle.timestamp
+                ] = candle
+                continue
+
+            # Для текущей свечи ticks считаются
+            # более свежими данными.
+            merged[
+                candle.timestamp
+            ] = candle
+
+        return list(
+            sorted(
+                merged.values(),
+                key=lambda candle:
+                    candle.timestamp,
+            )
+        )
 
     @staticmethod
     def _extract_candles(
         data: Any,
+        period: int | None = None,
     ) -> list[PocketOptionCandle]:
-        """Извлекает свечи из JSON."""
+        """Извлекает полноценные OHLC свечи из JSON."""
 
         raw_items: Any = data
 
-        if isinstance(data, dict):
+        if isinstance(
+            data,
+            dict,
+        ):
             for key in (
                 "candles",
                 "history",
@@ -2484,7 +3390,7 @@ class PocketOptionWebSocketClient:
     def _parse_candle(
         item: Any,
     ) -> PocketOptionCandle | None:
-        """Преобразует один элемент в свечу."""
+        """Преобразует один элемент в OHLC свечу."""
 
         if isinstance(item, dict):
             timestamp = (
@@ -2533,11 +3439,19 @@ class PocketOptionWebSocketClient:
             ):
                 return None
 
+            normalized_timestamp = (
+                PocketOptionWebSocketClient
+                ._normalize_timestamp(
+                    timestamp
+                )
+            )
+
+            if normalized_timestamp is None:
+                return None
+
             try:
                 return PocketOptionCandle(
-                    timestamp=int(
-                        float(timestamp)
-                    ),
+                    timestamp=normalized_timestamp,
                     open=float(
                         open_value
                     ),
@@ -2569,9 +3483,15 @@ class PocketOptionWebSocketClient:
                 return None
 
             try:
-                timestamp = int(
-                    float(item[0])
+                timestamp = (
+                    PocketOptionWebSocketClient
+                    ._normalize_timestamp(
+                        item[0]
+                    )
                 )
+
+                if timestamp is None:
+                    return None
 
                 a = float(item[1])
                 b = float(item[2])
@@ -2690,6 +3610,52 @@ class PocketOptionWebSocketClient:
 
         return None
 
+    def _resolve_legacy_history_waiter(
+        self,
+        symbol: str,
+        period: int,
+        candles: list[PocketOptionCandle],
+    ) -> None:
+        """
+        Fallback для history-событий без index.
+
+        Основной путь использует request_index.
+        """
+
+        for (
+            request_index,
+            meta,
+        ) in list(
+            self._history_request_meta.items()
+        ):
+            if meta != (
+                symbol,
+                period,
+            ):
+                continue
+
+            waiter = (
+                self._history_waiters_by_index.get(
+                    request_index
+                )
+            )
+
+            if (
+                waiter is not None
+                and not waiter.done()
+            ):
+                waiter.set_result(
+                    candles
+                )
+
+                print(
+                    "[PO] HISTORY FALLBACK "
+                    "WAITER RESOLVED:"
+                    f" index={request_index}"
+                )
+
+                return
+
     # ================================================================
     # PUBLIC DATA
     # ================================================================
@@ -2795,6 +3761,17 @@ class PocketOptionWebSocketClient:
                 for symbol, period
                 in self.subscriptions
             ],
+            "pending_history_requests": [
+                {
+                    "index": request_index,
+                    "symbol": meta[0],
+                    "period": meta[1],
+                }
+                for (
+                    request_index,
+                    meta,
+                ) in self._history_request_meta.items()
+            ],
             "server_time_synced": (
                 self.server_time_synced
             ),
@@ -2823,19 +3800,24 @@ class PocketOptionWebSocketClient:
     ) -> None:
         """Завершает ожидающие history-запросы ошибкой."""
 
+        error = PocketOptionWebSocketError(
+            reason
+        )
+
         for waiter in list(
-            self._history_waiters.values()
+            self._history_waiters_by_index.values()
         ):
             if waiter.done():
                 continue
 
             waiter.set_exception(
                 PocketOptionWebSocketError(
-                    reason
+                    str(error)
                 )
             )
 
-        self._history_waiters.clear()
+        self._history_waiters_by_index.clear()
+        self._history_request_meta.clear()
 
     # ================================================================
     # START / STOP
