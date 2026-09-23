@@ -285,6 +285,19 @@ class PocketOptionWebSocketClient:
         ] = set()
 
         # ============================================================
+        # UPDATE STREAM DIAGNOSTICS
+        #
+        # Нужны только для определения того,
+        # приходит ли после subscribe реальный updateStream.
+        # ============================================================
+
+        self.update_stream_count = 0
+        self.last_update_stream_at: float | None = None
+        self.last_update_stream_symbol: str | None = None
+        self.last_update_stream_price: float | None = None
+        self.last_update_stream_timestamp: float | None = None
+
+        # ============================================================
         # HISTORY REQUEST CORRELATION
         #
         # ВАЖНО:
@@ -1870,7 +1883,20 @@ class PocketOptionWebSocketClient:
         self,
         data: Any,
     ) -> None:
-        """Обрабатывает updateStream."""
+        """
+        Обрабатывает updateStream.
+
+        Диагностика показывает:
+            - сколько updateStream пришло;
+            - тип данных;
+            - количество элементов;
+            - содержимое каждого элемента;
+            - какой symbol/price/timestamp удалось извлечь;
+            - сколько ticks уже накоплено по EURUSD_otc.
+        """
+
+        self.update_stream_count += 1
+        self.last_update_stream_at = time.monotonic()
 
         items = (
             data
@@ -1881,10 +1907,164 @@ class PocketOptionWebSocketClient:
             else [data]
         )
 
-        for item in items:
+        print(
+            "[PO] UPDATE STREAM:"
+        )
+
+        print(
+            "[PO]   count="
+            f"{self.update_stream_count}"
+        )
+
+        print(
+            "[PO]   data_type="
+            f"{type(data).__name__}"
+        )
+
+        print(
+            "[PO]   items="
+            f"{len(items)}"
+        )
+
+        for item_index, item in enumerate(items, start=1):
+            print(
+                "[PO]   item["
+                f"{item_index}"
+                "]="
+                f"{item!r}"
+            )
+
+            symbol: str | None = None
+            price: float | None = None
+            timestamp: float | None = None
+
+            if isinstance(item, dict):
+                raw_symbol = (
+                    item.get("asset")
+                    or item.get("symbol")
+                    or item.get("active")
+                )
+
+                raw_price = (
+                    item.get("price")
+                    if item.get("price") is not None
+                    else item.get("value")
+                )
+
+                raw_timestamp = (
+                    item.get("timestamp")
+                    if item.get("timestamp") is not None
+                    else item.get("time")
+                )
+
+                if raw_symbol is not None:
+                    symbol = str(raw_symbol)
+
+                try:
+                    if raw_price is not None:
+                        price = float(raw_price)
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    price = None
+
+                try:
+                    if raw_timestamp is not None:
+                        timestamp = float(raw_timestamp)
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    timestamp = None
+
+            elif isinstance(item, list):
+                if len(item) >= 1:
+                    symbol = str(item[0])
+
+                if len(item) >= 2:
+                    try:
+                        first = float(item[1])
+                    except (
+                        TypeError,
+                        ValueError,
+                    ):
+                        first = None
+
+                    second: float | None = None
+
+                    if len(item) >= 3:
+                        try:
+                            second = float(item[2])
+                        except (
+                            TypeError,
+                            ValueError,
+                        ):
+                            second = None
+
+                    if first is not None:
+                        if (
+                            second is not None
+                            and first > 1_000_000_000
+                        ):
+                            timestamp = first
+                            price = second
+                        else:
+                            price = first
+
+                            if second is not None:
+                                timestamp = second
+
+            if symbol is not None:
+                self.last_update_stream_symbol = symbol
+
+            if price is not None:
+                self.last_update_stream_price = price
+
+            if timestamp is not None:
+                self.last_update_stream_timestamp = timestamp
+
+            print(
+                "[PO]   extracted:"
+                f" symbol={symbol}"
+                f" price={price}"
+                f" timestamp={timestamp}"
+            )
+
             await self._process_tick_like_data(
                 item
             )
+
+        normalized_eurusd = "EURUSD_otc"
+
+        print(
+            "[PO] UPDATE STREAM STATE:"
+        )
+
+        print(
+            "[PO]   total="
+            f"{self.update_stream_count}"
+        )
+
+        print(
+            "[PO]   last_symbol="
+            f"{self.last_update_stream_symbol}"
+        )
+
+        print(
+            "[PO]   last_price="
+            f"{self.last_update_stream_price}"
+        )
+
+        print(
+            "[PO]   last_timestamp="
+            f"{self.last_update_stream_timestamp}"
+        )
+
+        print(
+            "[PO]   EURUSD_otc ticks="
+            f"{len(self.ticks.get(normalized_eurusd, []))}"
+        )
 
     async def _handle_update_close_value(
         self,
@@ -2199,6 +2379,44 @@ class PocketOptionWebSocketClient:
             )
 
             # ========================================================
+            # UPDATE STREAM DIAGNOSTICS
+            # ========================================================
+
+            print(
+                "[PO] UPDATE STREAM BEFORE HISTORY:"
+            )
+
+            print(
+                "[PO]   update_stream_count="
+                f"{self.update_stream_count}"
+            )
+
+            print(
+                "[PO]   last_update_stream_at="
+                f"{self.last_update_stream_at}"
+            )
+
+            print(
+                "[PO]   last_update_stream_symbol="
+                f"{self.last_update_stream_symbol}"
+            )
+
+            print(
+                "[PO]   last_update_stream_price="
+                f"{self.last_update_stream_price}"
+            )
+
+            print(
+                "[PO]   last_update_stream_timestamp="
+                f"{self.last_update_stream_timestamp}"
+            )
+
+            print(
+                "[PO]   EURUSD_otc ticks="
+                f"{len(self.ticks.get('EURUSD_otc', []))}"
+            )
+
+            # ========================================================
             # HISTORY REQUEST
             # ========================================================
 
@@ -2360,6 +2578,31 @@ class PocketOptionWebSocketClient:
             print(
                 "[PO]   cached="
                 f"{len(cached)}"
+            )
+
+            print(
+                "[PO]   update_stream_count="
+                f"{self.update_stream_count}"
+            )
+
+            print(
+                "[PO]   last_update_stream_symbol="
+                f"{self.last_update_stream_symbol}"
+            )
+
+            print(
+                "[PO]   last_update_stream_price="
+                f"{self.last_update_stream_price}"
+            )
+
+            print(
+                "[PO]   last_update_stream_timestamp="
+                f"{self.last_update_stream_timestamp}"
+            )
+
+            print(
+                "[PO]   EURUSD_otc ticks="
+                f"{len(self.ticks.get('EURUSD_otc', []))}"
             )
 
             if cached:
@@ -3777,6 +4020,18 @@ class PocketOptionWebSocketClient:
             ),
             "server_time_offset": (
                 self.server_time_offset
+            ),
+            "update_stream_count": (
+                self.update_stream_count
+            ),
+            "last_update_stream_symbol": (
+                self.last_update_stream_symbol
+            ),
+            "last_update_stream_price": (
+                self.last_update_stream_price
+            ),
+            "last_update_stream_timestamp": (
+                self.last_update_stream_timestamp
             ),
             "last_message": self.last_message,
             "last_error": self.last_error,
