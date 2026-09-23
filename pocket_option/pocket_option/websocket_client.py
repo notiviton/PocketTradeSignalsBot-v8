@@ -267,7 +267,6 @@ class PocketOptionWebSocketClient:
                     autoping=False,
                     receive_timeout=None,
                 )
-                self._sync_time_from_headers(self.ws.headers)
 
                 await self._wait_engine_open()
 
