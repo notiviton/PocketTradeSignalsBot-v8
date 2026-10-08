@@ -364,23 +364,37 @@ class PocketOptionWebSocketClient:
         period: int,
     ) -> int:
         """
-        Возвращает время history-запроса.
+        Возвращает время для loadHistoryPeriod,
+        выровненное по границе периода.
 
-        Для периодов свечей сервер получает границу
-        текущей свечи, а не произвольную текущую секунду.
+        Например для period=60:
+
+            1791403897
+                    ↓
+            1791403860
+
+        Это соответствует началу текущей минутной
+        свечи, а не произвольной секунде внутри минуты.
         """
 
-        current_time = self._server_timestamp()
+        period = int(period)
 
-        if period >= 60:
-            return (
-                current_time // period
-            ) * period
+        if period <= 0:
+            return self._server_timestamp()
 
-        return current_time
+        server_timestamp = self._server_timestamp()
+
+        return (
+            server_timestamp // period
+        ) * period
 
     def _next_history_index(self) -> int:
-        """Генерирует уникальный index history-запроса."""
+        """
+        Генерирует уникальный index для history-запроса.
+
+        Pocket Option использует index для сопоставления
+        loadHistoryPeriod с LoadHistoryPeriodResult.
+        """
 
         self._history_request_index += 1
 
@@ -495,7 +509,12 @@ class PocketOptionWebSocketClient:
         self,
         headers: Any,
     ) -> None:
-        """Синхронизирует время по HTTP Date header."""
+        """
+        Синхронизирует время по HTTP Date header.
+
+        Это не меняет системные часы сервера.
+        Мы только храним локальную поправку.
+        """
 
         try:
             date_value = headers.get("Date")
@@ -510,7 +529,10 @@ class PocketOptionWebSocketClient:
                 date_value
             )
 
-            server_timestamp = parsed.timestamp()
+            server_timestamp = (
+                parsed.timestamp()
+            )
+
             local_timestamp = time.time()
 
             self.server_time_offset = (
@@ -536,7 +558,11 @@ class PocketOptionWebSocketClient:
     # ================================================================
 
     async def connect(self) -> None:
-        """Создаёт новое WebSocket-соединение."""
+        """
+        Создаёт новое WebSocket-соединение.
+
+        Старое соединение сначала полностью очищается.
+        """
 
         async with self._connection_lock:
 
@@ -734,7 +760,8 @@ class PocketOptionWebSocketClient:
                         float(
                             info.get(
                                 "pingInterval",
-                                self.PING_INTERVAL * 1000,
+                                self.PING_INTERVAL
+                                * 1000,
                             )
                         )
                         / 1000.0
@@ -744,7 +771,8 @@ class PocketOptionWebSocketClient:
                         float(
                             info.get(
                                 "pingTimeout",
-                                self.PING_TIMEOUT * 1000,
+                                self.PING_TIMEOUT
+                                * 1000,
                             )
                         )
                         / 1000.0
@@ -840,7 +868,9 @@ class PocketOptionWebSocketClient:
                                 dict,
                             ):
                                 self.socketio_sid = (
-                                    info.get("sid")
+                                    info.get(
+                                        "sid"
+                                    )
                                 )
 
                         except json.JSONDecodeError:
@@ -876,7 +906,7 @@ class PocketOptionWebSocketClient:
     async def send_auth(
         self,
     ) -> None:
-        """Отправляет AUTH в подтверждённом браузерном формате."""
+        """Отправляет AUTH в современном браузерном формате."""
 
         if self.ws is None:
             raise PocketOptionWebSocketError(
@@ -931,7 +961,9 @@ class PocketOptionWebSocketClient:
         elif token:
             debug_payload["sessionToken"] = "***"
         else:
-            debug_payload["sessionToken"] = "<empty>"
+            debug_payload["sessionToken"] = (
+                "<empty>"
+            )
 
         print(
             "[PO] AUTH DEBUG: "
@@ -978,6 +1010,11 @@ class PocketOptionWebSocketClient:
         print(
             "[PO] AUTH PACKET LENGTH: "
             f"{len(packet)}"
+        )
+
+        print(
+            "[PO] AUTH PACKET PREFIX: "
+            f"{packet[:40]}"
         )
 
         self.auth_sent_at = time.monotonic()
@@ -1299,7 +1336,6 @@ class PocketOptionWebSocketClient:
 
         try:
             raw = json.loads(data)
-
         except json.JSONDecodeError:
             return
 
@@ -1870,10 +1906,7 @@ class PocketOptionWebSocketClient:
             f"{len(items)}"
         )
 
-        for item_index, item in enumerate(
-            items,
-            start=1,
-        ):
+        for item_index, item in enumerate(items, start=1):
             print(
                 "[PO]   item["
                 f"{item_index}"
@@ -2301,18 +2334,10 @@ class PocketOptionWebSocketClient:
         )
 
         try:
-            # ========================================================
-            # SUBSCRIBE
-            # ========================================================
-
             await self.subscribe(
                 normalized,
                 period,
             )
-
-            # ========================================================
-            # ДИАГНОСТИЧЕСКАЯ ПАУЗА
-            # ========================================================
 
             await asyncio.sleep(1.0)
 
@@ -2320,10 +2345,6 @@ class PocketOptionWebSocketClient:
                 "[PO] После subscribe: "
                 "пауза 1.0 сек завершена"
             )
-
-            # ========================================================
-            # UPDATE STREAM DIAGNOSTICS
-            # ========================================================
 
             print(
                 "[PO] UPDATE STREAM BEFORE HISTORY:"
@@ -2361,16 +2382,21 @@ class PocketOptionWebSocketClient:
 
             # ========================================================
             # HISTORY REQUEST
+            #
+            # ВАЖНО:
+            # Время для loadHistoryPeriod выравнивается по границе
+            # выбранного периода.
+            #
+            # Например:
+            #     1791403897 -> 1791403860
+            #
+            # для period=60.
             # ========================================================
 
             request_time = (
                 self._history_request_timestamp(
                     period
                 )
-            )
-
-            raw_server_time = (
-                self._server_timestamp()
             )
 
             payload = {
@@ -2423,18 +2449,18 @@ class PocketOptionWebSocketClient:
             )
 
             print(
-                "[PO]   server_time_raw="
-                f"{raw_server_time}"
+                "[PO]   server_time="
+                f"{self._server_timestamp()}"
             )
 
             print(
-                "[PO]   server_time_aligned="
+                "[PO]   history_request_time="
                 f"{request_time}"
             )
 
             print(
-                "[PO]   alignment_delta="
-                f"{request_time - raw_server_time:+d}s"
+                "[PO]   time_alignment="
+                f"{request_time % period if period > 0 else 'n/a'}"
             )
 
             print(
@@ -2456,8 +2482,7 @@ class PocketOptionWebSocketClient:
                 f"asset={normalized} "
                 f"period={period} "
                 f"offset={history_offset} "
-                f"index={request_index} "
-                f"time={request_time}"
+                f"index={request_index}"
             )
 
             print(
@@ -2477,10 +2502,6 @@ class PocketOptionWebSocketClient:
                 "[PO] loadHistoryPeriod "
                 "отправлен, ожидание history..."
             )
-
-            # ========================================================
-            # WAIT HISTORY
-            # ========================================================
 
             result = await asyncio.wait_for(
                 waiter,
@@ -2606,7 +2627,13 @@ class PocketOptionWebSocketClient:
         event_name: str,
         data: Any,
     ) -> None:
-        """Обрабатывает history event."""
+        """
+        Обрабатывает history event.
+
+        Основная корреляция выполняется по index.
+        Если index отсутствует, используется осторожный
+        fallback по symbol/period.
+        """
 
         if not isinstance(
             data,
@@ -3160,7 +3187,15 @@ class PocketOptionWebSocketClient:
         items: list[Any],
         period: int,
     ) -> list[PocketOptionCandle]:
-        """Преобразует history data в свечи."""
+        """
+        Преобразует history data в свечи.
+
+        Если сервер прислал OHLC:
+            OHLC сохраняются как свечи.
+
+        Если сервер прислал ticks:
+            ticks группируются по period.
+        """
 
         if not items:
             return []
@@ -3196,7 +3231,7 @@ class PocketOptionWebSocketClient:
         if ohlc_candles:
             ohlc_candles.sort(
                 key=lambda candle:
-                candle.timestamp
+                    candle.timestamp
             )
 
             unique: dict[
@@ -3213,7 +3248,7 @@ class PocketOptionWebSocketClient:
                 sorted(
                     unique.values(),
                     key=lambda candle:
-                    candle.timestamp,
+                        candle.timestamp,
                 )
             )
 
@@ -3365,7 +3400,7 @@ class PocketOptionWebSocketClient:
                     bucket_timestamp
                 ],
                 key=lambda item:
-                item[0],
+                    item[0],
             )
 
             if not values:
@@ -3478,7 +3513,7 @@ class PocketOptionWebSocketClient:
             sorted(
                 merged.values(),
                 key=lambda candle:
-                candle.timestamp,
+                    candle.timestamp,
             )
         )
 
@@ -3542,7 +3577,7 @@ class PocketOptionWebSocketClient:
 
         result.sort(
             key=lambda candle:
-            candle.timestamp
+                candle.timestamp
         )
 
         unique: dict[
@@ -3559,7 +3594,7 @@ class PocketOptionWebSocketClient:
             sorted(
                 unique.values(),
                 key=lambda candle:
-                candle.timestamp,
+                    candle.timestamp,
             )
         )
 
@@ -4044,7 +4079,19 @@ class PocketOptionWebSocketClient:
     async def _lifecycle_loop(
         self,
     ) -> None:
-        """Следит за reader и выполняет reconnect."""
+        """
+        Следит за reader.
+
+        Если WebSocket оборвался:
+
+            reader завершился
+                ↓
+            cleanup
+                ↓
+            reconnect
+                ↓
+            новый AUTH
+        """
 
         delay = self.RECONNECT_MIN
 
@@ -4151,7 +4198,12 @@ class PocketOptionWebSocketClient:
         self,
         preserve_lifecycle: bool = False,
     ) -> None:
-        """Безопасно закрывает текущее соединение."""
+        """
+        Безопасно закрывает текущее соединение.
+
+        preserve_lifecycle=True используется самим
+        lifecycle task, чтобы он случайно не отменил себя.
+        """
 
         current = asyncio.current_task()
 
@@ -4210,7 +4262,7 @@ class PocketOptionWebSocketClient:
     async def stop(
         self,
     ) -> None:
-        """Полностью останавливает WebSocket-клиент."""
+        """Полностью останавливает WebSocket-клиента."""
 
         print(
             "[PO] Остановка WebSocket клиента..."
@@ -4257,7 +4309,11 @@ class PocketOptionWebSocketClient:
         self,
         reconnect: bool = True,
     ) -> None:
-        """Совместимость со старым интерфейсом."""
+        """
+        Совместимость со старым интерфейсом.
+
+        Основной lifecycle запускается через start().
+        """
 
         if not reconnect:
             await self.connect()
